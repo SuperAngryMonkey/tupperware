@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local secrets - never commit
+**/.tailscale/oauth
+*oauth*
+.env
+.env.local
+
+# Build artifacts
+*.tar.gz
+*.zip
+
+# Logs
+*.log
