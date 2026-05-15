@@ -14,7 +14,6 @@ fi
 echo "[*] Tupperware installer"
 echo
 
-# Verify Proxmox-ness
 if ! command -v pct >/dev/null 2>&1; then
     echo "ERROR: pct not found. This must run on a Proxmox VE host." >&2
     exit 1
@@ -24,7 +23,6 @@ if ! command -v pveam >/dev/null 2>&1; then
     exit 1
 fi
 
-# Verify OAuth credentials are stashed
 if [[ ! -r /root/.tailscale/oauth ]]; then
     echo "ERROR: /root/.tailscale/oauth is missing or unreadable." >&2
     echo "       Create it first with your Tailscale OAuth client credentials." >&2
@@ -32,7 +30,16 @@ if [[ ! -r /root/.tailscale/oauth ]]; then
     exit 1
 fi
 
-# Try to install from local checkout first, fall back to curl
+# Clean up legacy install (older versions used different script names)
+if [[ -f /usr/local/sbin/build-tailscale-template.sh ]]; then
+    echo "[*] Removing legacy script: build-tailscale-template.sh"
+    rm -f /usr/local/sbin/build-tailscale-template.sh
+fi
+if [[ -f /usr/local/sbin/new-tailscale-ct.sh ]]; then
+    echo "[*] Removing legacy script: new-tailscale-ct.sh"
+    rm -f /usr/local/sbin/new-tailscale-ct.sh
+fi
+
 INSTALL_FROM_LOCAL=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/tupperware-build-template.sh" && -f "$SCRIPT_DIR/tupperware-new.sh" ]]; then
@@ -59,7 +66,7 @@ install_script tupperware-build-template.sh
 install_script tupperware-new.sh
 
 echo
-echo "[✓] Tupperware tooling installed."
+echo "[OK] Tupperware tooling installed."
 echo
 echo "Next steps:"
 echo "  1. Build the template:    tupperware-build-template"
