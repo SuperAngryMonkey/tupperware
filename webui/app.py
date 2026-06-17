@@ -9,6 +9,7 @@ from flask import Flask, render_template_string, request, Response, stream_with_
 app = Flask(__name__)
 
 CLONE_SCRIPT = "/usr/local/sbin/tupperware-new"
+DEFAULT_STORAGE = "local-lvm"
 
 
 def next_free_vmid(start=200):
@@ -29,6 +30,27 @@ def next_free_vmid(start=200):
     while v in used:
         v += 1
     return v
+
+
+def list_storage_backends():
+    """Return list of storage backends that support container content (rootdir)."""
+    backends = []
+    try:
+        out = subprocess.check_output(
+            ["pvesm", "status", "-content", "rootdir"],
+            text=True, timeout=5
+        )
+        for line in out.strip().split("\n")[1:]:  # skip header
+            parts = line.split()
+            if len(parts) >= 2:
+                backends.append({
+                    "name": parts[0],
+                    "type": parts[1],
+                    "active": parts[2] if len(parts) > 2 else "?",
+                })
+    except Exception:
+        pass
+    return backends
 
 
 def host_metrics():
@@ -56,7 +78,6 @@ def host_metrics():
 
 
 def parse_pct_config(vmid):
-    """Parse pct config output into a dict."""
     cfg = {}
     try:
         out = subprocess.check_output(["pct", "config", str(vmid)], text=True, timeout=5)
@@ -70,7 +91,6 @@ def parse_pct_config(vmid):
 
 
 def container_ip(vmid):
-    """Try to get the LAN IP of a running container."""
     try:
         out = subprocess.check_output(
             ["pct", "exec", str(vmid), "--", "hostname", "-I"],
@@ -86,7 +106,6 @@ def container_ip(vmid):
 
 
 def container_tailnet_ip(vmid):
-    """Get the tailnet IP of a running container."""
     try:
         out = subprocess.check_output(
             ["pct", "exec", str(vmid), "--", "tailscale", "ip", "-4"],
@@ -97,12 +116,19 @@ def container_tailnet_ip(vmid):
         return ""
 
 
+def container_storage(cfg):
+    """Extract storage backend name from a pct config dict."""
+    rootfs = cfg.get("rootfs", "")
+    if ":" in rootfs:
+        return rootfs.split(":", 1)[0]
+    return ""
+
+
 def list_containers():
-    """List all LXC containers with their config details."""
     containers = []
     try:
         out = subprocess.check_output(["pct", "list"], text=True, timeout=5)
-        lines = out.strip().split("\n")[1:]  # skip header
+        lines = out.strip().split("\n")[1:]
         for line in lines:
             parts = line.split(None, 3)
             if len(parts) < 3:
@@ -112,9 +138,8 @@ def list_containers():
             name = parts[2] if len(parts) > 2 else ""
             cfg = parse_pct_config(vmid)
             if cfg.get("template") == "1":
-                continue  # skip templates
+                continue
             desc = cfg.get("description", "")
-            # Proxmox URL-encodes newlines in description
             desc = desc.replace("%0A", "\n").replace("%20", " ")
             tags = cfg.get("tags", "")
             rootfs = cfg.get("rootfs", "")
@@ -131,6 +156,7 @@ def list_containers():
                 "cores": cfg.get("cores", "?"),
                 "memory": cfg.get("memory", "?"),
                 "disk": disk_size,
+                "storage": container_storage(cfg),
                 "lan_ip": lan_ip,
                 "ts_ip": ts_ip,
                 "description": desc,
@@ -179,12 +205,15 @@ body{padding:20px;max-width:1400px;margin:0 auto;}
 .panel-badge.err{color:var(--danger);border-color:var(--danger);}
 .panel-badge.idle{color:var(--txt3);border-color:var(--txt3);}
 .form-grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:12px;}
-.form-grid.row2{grid-template-columns:2fr 1fr;margin-top:12px;}
+.form-grid.row2{grid-template-columns:1fr 1fr 1fr;margin-top:12px;}
+.form-grid.row3{grid-template-columns:2fr 1fr;margin-top:12px;}
 .form-field{display:flex;flex-direction:column;gap:6px;}
 .form-label{font-size:9px;color:var(--txt2);letter-spacing:2px;text-transform:uppercase;}
 .form-input{background:var(--c3);border:var(--border);color:var(--txt);font-family:var(--fmono);font-size:11px;padding:10px 14px;outline:none;}
 .form-input:focus{border-color:var(--acc);}
 .form-input::placeholder{color:var(--txt3);}
+.form-select{background:var(--c3);border:var(--border);color:var(--txt);font-family:var(--fmono);font-size:11px;padding:10px 14px;outline:none;appearance:none;cursor:pointer;}
+.form-select:focus{border-color:var(--acc);}
 .btn-row{margin-top:16px;display:flex;gap:8px;}
 .btn{background:transparent;border:1px solid var(--acc);color:var(--acc);font-family:var(--fmono);font-size:11px;padding:12px 28px;cursor:pointer;letter-spacing:3px;text-transform:uppercase;}
 .btn:hover{background:rgba(0,212,255,0.1);}
@@ -209,10 +238,11 @@ body{padding:20px;max-width:1400px;margin:0 auto;}
 .inv-ip{font-size:10px;color:var(--txt2);}
 .inv-ip-ts{color:var(--acc);}
 .inv-tags{display:inline-block;padding:1px 6px;border:1px solid var(--acc2);color:var(--acc2);font-size:9px;margin-right:4px;}
-.inv-notes{color:var(--txt2);font-size:10px;font-style:italic;max-width:300px;white-space:pre-wrap;}
+.inv-storage{font-size:10px;color:var(--txt2);}
+.inv-notes{color:var(--txt2);font-size:10px;font-style:italic;max-width:280px;white-space:pre-wrap;}
 .inv-notes-empty{color:var(--txt3);font-style:italic;}
 .inv-empty{text-align:center;color:var(--txt3);font-style:italic;padding:30px;}
-@media (max-width:900px){.metrics{grid-template-columns:repeat(2,1fr);}.form-grid{grid-template-columns:1fr 1fr;}.form-grid.row2{grid-template-columns:1fr;}.inv-table{font-size:10px;}}
+@media (max-width:900px){.metrics{grid-template-columns:repeat(2,1fr);}.form-grid{grid-template-columns:1fr 1fr;}.form-grid.row2{grid-template-columns:1fr;}.form-grid.row3{grid-template-columns:1fr;}.inv-table{font-size:10px;}}
 </style></head><body>
 <div class="hdr">
   <div class="hdr-left"><div class="logo">TUPPERWARE</div><div class="subtitle">LXC PROVISIONER // {{ m.hostname }}</div></div>
@@ -235,6 +265,16 @@ body{padding:20px;max-width:1400px;margin:0 auto;}
       <div class="form-field"><div class="form-label">DISK GB</div><input class="form-input" type="number" name="disk" placeholder="4" min="4"></div>
     </div>
     <div class="form-grid row2">
+      <div class="form-field"><div class="form-label">STORAGE BACKEND</div>
+        <select class="form-select" name="storage">
+          {% for s in storages %}
+            <option value="{{ s.name }}"{% if s.name == default_storage %} selected{% endif %}>{{ s.name }} ({{ s.type }})</option>
+          {% endfor %}
+          {% if not storages %}
+            <option value="local-lvm">local-lvm (default)</option>
+          {% endif %}
+        </select>
+      </div>
       <div class="form-field"><div class="form-label">ROOT PASSWORD (OPTIONAL)</div><input class="form-input" type="password" name="rootpw" placeholder="leave blank for tailscale ssh only" autocomplete="new-password"></div>
     </div>
     <div class="btn-row"><button class="btn" type="submit" id="submit-btn">CLONE &amp; JOIN TAILNET</button></div>
@@ -256,6 +296,7 @@ body{padding:20px;max-width:1400px;margin:0 auto;}
         <th>HOSTNAME</th>
         <th>STATUS</th>
         <th>CPU / MEM / DISK</th>
+        <th>STORAGE</th>
         <th>NETWORK</th>
         <th>TAGS</th>
         <th>NOTES</th>
@@ -268,6 +309,7 @@ body{padding:20px;max-width:1400px;margin:0 auto;}
         <td class="inv-name">{{ c.name }}</td>
         <td><span class="inv-status {{ c.status }}">{{ c.status }}</span></td>
         <td>{{ c.cores }}c / {{ c.memory }}MB / {{ c.disk }}</td>
+        <td class="inv-storage">{{ c.storage or '—' }}</td>
         <td class="inv-ip">
           {% if c.lan_ip %}{{ c.lan_ip }}<br>{% endif %}
           {% if c.ts_ip %}<span class="inv-ip-ts">{{ c.ts_ip }}</span>{% endif %}
@@ -344,7 +386,13 @@ form.addEventListener('submit',async function(e){
 
 @app.route("/")
 def index():
-    return render_template_string(INDEX, m=host_metrics(), containers=list_containers())
+    return render_template_string(
+        INDEX,
+        m=host_metrics(),
+        containers=list_containers(),
+        storages=list_storage_backends(),
+        default_storage=DEFAULT_STORAGE,
+    )
 
 
 @app.route("/clone-stream", methods=["POST"])
@@ -363,12 +411,19 @@ def clone_stream():
     memory = request.form.get("memory", "").strip()
     disk = request.form.get("disk", "").strip()
     rootpw = request.form.get("rootpw", "")
+    storage = request.form.get("storage", "").strip() or DEFAULT_STORAGE
+
+    # Validate storage name (simple safety check)
+    if not re.match(r"^[a-zA-Z0-9_\-]+$", storage):
+        return Response("[!] Invalid storage name.\n", mimetype="text/plain")
 
     def generate():
-        yield "[*] Tupperware: cloning " + hostname + " as VMID " + str(vmid_int) + "\n"
+        yield "[*] Tupperware: cloning " + hostname + " as VMID " + str(vmid_int) + " on storage '" + storage + "'\n"
         try:
-            proc = subprocess.Popen([CLONE_SCRIPT, str(vmid_int), hostname],
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            proc = subprocess.Popen(
+                [CLONE_SCRIPT, str(vmid_int), hostname, "--storage", storage],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            )
             for line in iter(proc.stdout.readline, ""):
                 yield line
             proc.wait()
@@ -390,8 +445,10 @@ def clone_stream():
                 if r.stderr: yield r.stderr
             if rootpw:
                 yield "[*] Setting root password...\n"
-                r = subprocess.run(["pct", "exec", str(vmid_int), "--", "bash", "-c", "echo 'root:" + rootpw + "' | chpasswd"],
-                                   capture_output=True, text=True)
+                r = subprocess.run(
+                    ["pct", "exec", str(vmid_int), "--", "bash", "-c", "echo 'root:" + rootpw + "' | chpasswd"],
+                    capture_output=True, text=True,
+                )
                 yield "    Password set.\n" if r.returncode == 0 else "    Failed: " + r.stderr + "\n"
             yield "\n[OK] All done. " + hostname + " (VMID " + str(vmid_int) + ") should be on the tailnet.\n"
         except Exception as e:

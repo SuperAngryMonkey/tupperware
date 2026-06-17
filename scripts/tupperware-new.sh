@@ -3,37 +3,79 @@
 # Clones the Tupperware template, mints a fresh OAuth-based auth key,
 # injects it into the new container, and triggers the firstboot service.
 #
-# Usage: tupperware-new <new-vmid> <hostname>
-# Example: tupperware-new 201 lab-lxc-01
+# Usage: tupperware-new <new-vmid> <hostname> [--storage <name>]
+#
+# Examples:
+#   tupperware-new 201 lab-lxc-01
+#   tupperware-new 202 db-cache --storage local-zfs
 #
 # Override defaults via env vars:
 #   TEMPLATE_VMID=9001 TAG=tag:prod tupperware-new 201 prod-lxc-01
+#   STORAGE=data-nvme tupperware-new 203 fast-app
 
 set -euo pipefail
 
 TEMPLATE_VMID="${TEMPLATE_VMID:-9000}"
 OAUTH_FILE="${OAUTH_FILE:-/root/.tailscale/oauth}"
 TAG="${TAG:-tag:lxc}"
+STORAGE="${STORAGE:-local-lvm}"
 NETWORK_WAIT_RETRIES="${NETWORK_WAIT_RETRIES:-150}"
 
-if [[ $# -lt 2 ]]; then
+usage() {
     cat >&2 <<USAGE
-Usage: tupperware-new <new-vmid> <hostname>
+Usage: tupperware-new <new-vmid> <hostname> [--storage <name>]
 
 Arguments:
   new-vmid    VMID for the new container (e.g., 201)
   hostname    Hostname for the new container (used as Tailscale hostname)
 
+Options:
+  --storage <name>   Proxmox storage backend to use (default: local-lvm)
+
 Environment overrides:
   TEMPLATE_VMID   VMID of the template (default: 9000)
   OAUTH_FILE      Path to OAuth credentials (default: /root/.tailscale/oauth)
   TAG             Tailscale tag for the device (default: tag:lxc)
+  STORAGE         Same as --storage flag (flag takes precedence)
+
+List available storage on this host:
+  pvesm status -content rootdir
 USAGE
     exit 1
+}
+
+# Parse positional args + flags
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --storage)
+            STORAGE="$2"
+            shift 2
+            ;;
+        --storage=*)
+            STORAGE="${1#--storage=}"
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --*)
+            echo "ERROR: Unknown option: $1" >&2
+            usage
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ ${#POSITIONAL[@]} -lt 2 ]]; then
+    usage
 fi
 
-NEW_VMID="$1"
-NEW_HOST="$2"
+NEW_VMID="${POSITIONAL[0]}"
+NEW_HOST="${POSITIONAL[1]}"
 
 # Validate hostname
 if ! [[ "$NEW_HOST" =~ ^[a-zA-Z0-9-]+$ ]]; then
@@ -44,6 +86,15 @@ fi
 # Validate VMID
 if ! [[ "$NEW_VMID" =~ ^[0-9]+$ ]] || (( NEW_VMID < 100 )); then
     echo "ERROR: VMID must be a number >= 100." >&2
+    exit 1
+fi
+
+# Validate storage exists and supports rootdir content
+if ! pvesm status -content rootdir 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$STORAGE"; then
+    echo "ERROR: Storage '$STORAGE' not found or does not support container content (rootdir)." >&2
+    echo >&2
+    echo "Available storage backends supporting containers:" >&2
+    pvesm status -content rootdir 2>/dev/null | awk 'NR>1 {printf "  - %s (%s, %s)\n", $1, $2, $3}' >&2 || echo "  (none found)" >&2
     exit 1
 fi
 
@@ -111,8 +162,8 @@ if [[ -z "$TS_KEY" ]]; then
 fi
 
 # Clone
-echo "[*] Cloning $TEMPLATE_VMID -> $NEW_VMID ($NEW_HOST)..."
-pct clone "$TEMPLATE_VMID" "$NEW_VMID" --hostname "$NEW_HOST"
+echo "[*] Cloning $TEMPLATE_VMID -> $NEW_VMID ($NEW_HOST) on storage '$STORAGE'..."
+pct clone "$TEMPLATE_VMID" "$NEW_VMID" --hostname "$NEW_HOST" --storage "$STORAGE"
 
 echo "[*] Starting container..."
 pct start "$NEW_VMID"
@@ -139,5 +190,5 @@ pct exec "$NEW_VMID" -- systemctl start tailscale-firstboot.service
 
 sleep 4
 echo
-echo "[✓] $NEW_HOST should be on the tailnet."
-echo "    Verify: pct exec $NEW_VMID -- tailscale status"
+echo "[OK] $NEW_HOST should be on the tailnet."
+echo "     Verify: pct exec $NEW_VMID -- tailscale status"
