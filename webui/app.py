@@ -10,6 +10,35 @@ app = Flask(__name__)
 
 CLONE_SCRIPT = "/usr/local/sbin/tupperware-new"
 DEFAULT_STORAGE = "local-lvm"
+TEMPLATE_VMID = int(os.environ.get("TEMPLATE_VMID", "9000"))
+SAMPLE_TEMPLATE_URL = "https://github.com/SuperAngryMonkey/tupperware/releases/latest/download/tupperware-template.tar.zst"
+
+
+def template_exists():
+    """Return True if TEMPLATE_VMID exists and is a template."""
+    try:
+        subprocess.check_output(
+            ["pct", "status", str(TEMPLATE_VMID)],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    # status exists; check it's actually a template
+    try:
+        out = subprocess.check_output(
+            ["pct", "config", str(TEMPLATE_VMID)],
+            text=True,
+            timeout=5,
+        )
+        for line in out.split("\n"):
+            if line.startswith("template:"):
+                val = line.split(":", 1)[1].strip()
+                return val == "1"
+    except Exception:
+        pass
+    return False
 
 
 def next_free_vmid(start=200):
@@ -33,14 +62,13 @@ def next_free_vmid(start=200):
 
 
 def list_storage_backends():
-    """Return list of storage backends that support container content (rootdir)."""
     backends = []
     try:
         out = subprocess.check_output(
             ["pvesm", "status", "-content", "rootdir"],
             text=True, timeout=5
         )
-        for line in out.strip().split("\n")[1:]:  # skip header
+        for line in out.strip().split("\n")[1:]:
             parts = line.split()
             if len(parts) >= 2:
                 backends.append({
@@ -117,7 +145,6 @@ def container_tailnet_ip(vmid):
 
 
 def container_storage(cfg):
-    """Extract storage backend name from a pct config dict."""
     rootfs = cfg.get("rootfs", "")
     if ":" in rootfs:
         return rootfs.split(":", 1)[0]
@@ -167,10 +194,7 @@ def list_containers():
     return containers
 
 
-INDEX = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>TUPPERWARE</title>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Bebas+Neue&display=swap" rel="stylesheet">
-<style>
+SHARED_STYLE = r"""
 :root{--c1:#0a0a0f;--c2:#0f0f1a;--c3:#14141f;--acc:#00d4ff;--acc2:#ff6b35;--acc3:#00ff88;--danger:#ff3366;--txt:#e8e8f0;--txt2:#8888aa;--txt3:#4444aa;--fmono:'IBM Plex Mono',monospace;--fdisplay:'Bebas Neue',sans-serif;--border:1px solid rgba(0,212,255,0.12);--border-strong:1px solid rgba(0,212,255,0.2);--border-subtle:1px solid rgba(255,255,255,0.05);}
 *{box-sizing:border-box;margin:0;padding:0;}
 html,body{height:100%;background:var(--c1);color:var(--txt);font-family:var(--fmono);font-size:12px;}
@@ -182,8 +206,109 @@ body{padding:20px;max-width:1400px;margin:0 auto;}
 .subtitle{font-size:10px;color:var(--txt2);letter-spacing:2px;text-transform:uppercase;}
 .clock{font-size:16px;color:var(--txt2);letter-spacing:2px;}
 .status-dot{width:8px;height:8px;border-radius:50%;background:var(--acc3);box-shadow:0 0 8px var(--acc3);animation:pulse 2s infinite;}
+.status-dot.warn{background:var(--acc2);box-shadow:0 0 8px var(--acc2);}
 .status-txt{font-size:10px;color:var(--acc3);letter-spacing:1px;}
+.status-txt.warn{color:var(--acc2);}
 @keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.4;}}
+.panel{background:var(--c2);border:var(--border);padding:16px;margin-bottom:16px;}
+.panel-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:8px;border-bottom:var(--border-subtle);}
+.panel-title{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--txt2);}
+"""
+
+
+SETUP_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>TUPPERWARE - SETUP REQUIRED</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Bebas+Neue&display=swap" rel="stylesheet">
+<style>
+""" + SHARED_STYLE + r"""
+.setup-banner{background:var(--c2);border:1px solid var(--acc2);padding:24px;margin-bottom:20px;}
+.setup-title{font-family:var(--fdisplay);font-size:28px;letter-spacing:3px;color:var(--acc2);margin-bottom:8px;}
+.setup-msg{color:var(--txt);font-size:13px;line-height:1.6;margin-bottom:12px;}
+.setup-detail{color:var(--txt2);font-size:11px;line-height:1.6;}
+.opt-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px;}
+@media (max-width:900px){.opt-grid{grid-template-columns:1fr;}}
+.opt{background:var(--c2);border:var(--border);padding:20px;}
+.opt-num{font-family:var(--fdisplay);font-size:36px;color:var(--acc);line-height:1;margin-bottom:8px;}
+.opt-name{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--txt);margin-bottom:8px;font-weight:500;}
+.opt-desc{font-size:11px;color:var(--txt2);line-height:1.5;margin-bottom:12px;}
+.opt-time{font-size:9px;color:var(--txt3);letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;}
+.opt-cmd{background:#000;border:var(--border);padding:10px 12px;font-family:var(--fmono);font-size:10px;color:var(--acc3);word-break:break-all;line-height:1.5;}
+.opt-cmd-comment{color:var(--txt3);}
+.detail-panel{background:var(--c2);border:var(--border);padding:16px;}
+.detail-title{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--txt2);margin-bottom:12px;padding-bottom:8px;border-bottom:var(--border-subtle);}
+.detail-body{color:var(--txt2);font-size:11px;line-height:1.6;}
+.detail-body code{background:var(--c3);padding:2px 6px;border:var(--border-subtle);color:var(--acc);font-size:10px;}
+</style></head><body>
+<div class="hdr">
+  <div class="hdr-left"><div class="logo">TUPPERWARE</div><div class="subtitle">LXC PROVISIONER // {{ hostname }}</div></div>
+  <div class="hdr-right"><div class="status-dot warn"></div><div class="status-txt warn">SETUP REQUIRED</div></div>
+</div>
+
+<div class="setup-banner">
+  <div class="setup-title">NO TEMPLATE FOUND</div>
+  <div class="setup-msg">Tupperware needs an LXC template at VMID {{ template_vmid }} to clone containers from.</div>
+  <div class="setup-detail">Pick one of the three options below. Once a template exists at VMID {{ template_vmid }}, refresh this page and Tupperware is ready.</div>
+</div>
+
+<div class="opt-grid">
+
+  <div class="opt">
+    <div class="opt-num">1</div>
+    <div class="opt-name">Download sample template</div>
+    <div class="opt-time">Fastest &mdash; ~2 minutes</div>
+    <div class="opt-desc">Download a pre-built Tupperware-ready Debian 12 template from GitHub Releases. Ready to clone immediately.</div>
+    <div class="opt-cmd"><span class="opt-cmd-comment"># On this Proxmox host:</span><br>
+tupperware-import-template
+    </div>
+  </div>
+
+  <div class="opt">
+    <div class="opt-num">2</div>
+    <div class="opt-name">Build from scratch</div>
+    <div class="opt-time">~4 minutes</div>
+    <div class="opt-desc">Build a fresh template using the standard Debian 12 LXC template, with Tailscale and the firstboot service injected.</div>
+    <div class="opt-cmd"><span class="opt-cmd-comment"># On this Proxmox host:</span><br>
+tupperware-build-template
+    </div>
+  </div>
+
+  <div class="opt">
+    <div class="opt-num">3</div>
+    <div class="opt-name">Use your own template</div>
+    <div class="opt-time">Manual</div>
+    <div class="opt-desc">If you have an existing template at a different VMID, point Tupperware at it. (Must have Tailscale + tailscale-firstboot.service installed.)</div>
+    <div class="opt-cmd"><span class="opt-cmd-comment"># Edit /etc/systemd/system/tupperware.service:</span><br>
+Environment=TEMPLATE_VMID=&lt;your-vmid&gt;<br>
+<span class="opt-cmd-comment"># Then:</span><br>
+systemctl daemon-reload<br>
+systemctl restart tupperware
+    </div>
+  </div>
+
+</div>
+
+<div class="detail-panel">
+  <div class="detail-title">WHAT'S A TUPPERWARE-READY TEMPLATE?</div>
+  <div class="detail-body">
+    Any Proxmox LXC template that has:<br>
+    &nbsp;&nbsp;1. Tailscale installed (<code>apt install tailscale</code>)<br>
+    &nbsp;&nbsp;2. A <code>tailscale-firstboot.service</code> systemd unit that reads <code>/etc/tailscale/authkey</code> on boot, runs <code>tailscale up</code>, then self-disables<br>
+    &nbsp;&nbsp;3. Network configured for DHCP on <code>eth0</code><br>
+    &nbsp;&nbsp;4. <code>/dev/net/tun</code> passthrough enabled in the LXC config<br>
+    <br>
+    Both <code>tupperware-import-template</code> (Option 1) and <code>tupperware-build-template</code> (Option 2) produce templates that meet these requirements.
+  </div>
+</div>
+
+</body></html>
+"""
+
+
+INDEX = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>TUPPERWARE</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Bebas+Neue&display=swap" rel="stylesheet">
+<style>
+""" + SHARED_STYLE + r"""
 .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;}
 .metric{background:var(--c2);border:var(--border);padding:16px;position:relative;overflow:hidden;}
 .metric::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;}
@@ -196,9 +321,6 @@ body{padding:20px;max-width:1400px;margin:0 auto;}
 .metric.orange .metric-val{color:var(--acc2);}
 .metric.green .metric-val{color:var(--acc3);}
 .metric-sub{font-size:9px;color:var(--txt3);margin-top:4px;}
-.panel{background:var(--c2);border:var(--border);padding:16px;margin-bottom:16px;}
-.panel-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:8px;border-bottom:var(--border-subtle);}
-.panel-title{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--txt2);}
 .panel-badge{font-size:9px;padding:2px 8px;border:1px solid;letter-spacing:1px;}
 .panel-badge.live{color:var(--acc3);border-color:var(--acc3);}
 .panel-badge.warn{color:var(--acc2);border-color:var(--acc2);}
@@ -206,7 +328,6 @@ body{padding:20px;max-width:1400px;margin:0 auto;}
 .panel-badge.idle{color:var(--txt3);border-color:var(--txt3);}
 .form-grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:12px;}
 .form-grid.row2{grid-template-columns:1fr 1fr 1fr;margin-top:12px;}
-.form-grid.row3{grid-template-columns:2fr 1fr;margin-top:12px;}
 .form-field{display:flex;flex-direction:column;gap:6px;}
 .form-label{font-size:9px;color:var(--txt2);letter-spacing:2px;text-transform:uppercase;}
 .form-input{background:var(--c3);border:var(--border);color:var(--txt);font-family:var(--fmono);font-size:11px;padding:10px 14px;outline:none;}
@@ -242,7 +363,7 @@ body{padding:20px;max-width:1400px;margin:0 auto;}
 .inv-notes{color:var(--txt2);font-size:10px;font-style:italic;max-width:280px;white-space:pre-wrap;}
 .inv-notes-empty{color:var(--txt3);font-style:italic;}
 .inv-empty{text-align:center;color:var(--txt3);font-style:italic;padding:30px;}
-@media (max-width:900px){.metrics{grid-template-columns:repeat(2,1fr);}.form-grid{grid-template-columns:1fr 1fr;}.form-grid.row2{grid-template-columns:1fr;}.form-grid.row3{grid-template-columns:1fr;}.inv-table{font-size:10px;}}
+@media (max-width:900px){.metrics{grid-template-columns:repeat(2,1fr);}.form-grid{grid-template-columns:1fr 1fr;}.form-grid.row2{grid-template-columns:1fr;}.inv-table{font-size:10px;}}
 </style></head><body>
 <div class="hdr">
   <div class="hdr-left"><div class="logo">TUPPERWARE</div><div class="subtitle">LXC PROVISIONER // {{ m.hostname }}</div></div>
@@ -386,6 +507,17 @@ form.addEventListener('submit',async function(e){
 
 @app.route("/")
 def index():
+    if not template_exists():
+        try:
+            hostname = subprocess.check_output(["hostname"], text=True).strip()
+        except Exception:
+            hostname = "proxmox"
+        return render_template_string(
+            SETUP_PAGE,
+            hostname=hostname,
+            template_vmid=TEMPLATE_VMID,
+            sample_url=SAMPLE_TEMPLATE_URL,
+        )
     return render_template_string(
         INDEX,
         m=host_metrics(),
@@ -397,6 +529,9 @@ def index():
 
 @app.route("/clone-stream", methods=["POST"])
 def clone_stream():
+    if not template_exists():
+        return Response("[!] No template found at VMID " + str(TEMPLATE_VMID) + ". Cannot clone.\n", mimetype="text/plain")
+
     hostname = request.form.get("hostname", "").strip()
     if not re.match(r"^[a-zA-Z0-9-]+$", hostname):
         return Response("[!] Invalid hostname.\n", mimetype="text/plain")
@@ -413,7 +548,6 @@ def clone_stream():
     rootpw = request.form.get("rootpw", "")
     storage = request.form.get("storage", "").strip() or DEFAULT_STORAGE
 
-    # Validate storage name (simple safety check)
     if not re.match(r"^[a-zA-Z0-9_\-]+$", storage):
         return Response("[!] Invalid storage name.\n", mimetype="text/plain")
 

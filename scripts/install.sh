@@ -24,14 +24,12 @@ if ! command -v pveam >/dev/null 2>&1; then
 fi
 
 # Clean up legacy install (older versions used different script names)
-if [[ -f /usr/local/sbin/build-tailscale-template.sh ]]; then
-    echo "[*] Removing legacy script: build-tailscale-template.sh"
-    rm -f /usr/local/sbin/build-tailscale-template.sh
-fi
-if [[ -f /usr/local/sbin/new-tailscale-ct.sh ]]; then
-    echo "[*] Removing legacy script: new-tailscale-ct.sh"
-    rm -f /usr/local/sbin/new-tailscale-ct.sh
-fi
+for legacy in build-tailscale-template.sh new-tailscale-ct.sh; do
+    if [[ -f /usr/local/sbin/$legacy ]]; then
+        echo "[*] Removing legacy script: $legacy"
+        rm -f /usr/local/sbin/$legacy
+    fi
+done
 
 INSTALL_FROM_LOCAL=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,18 +53,28 @@ install_script() {
 }
 
 echo "[*] Installing scripts..."
-install_script tupperware-preflight.sh
-install_script tupperware-build-template.sh
+install_script tupperware-preflight.sh || true
 install_script tupperware-new.sh
-install_script tupperware-uninstall.sh
+install_script tupperware-build-template.sh
+install_script tupperware-import-template.sh
+install_script tupperware-export-template.sh
+install_script tupperware-uninstall.sh || true
 
 echo
 echo "[OK] Tupperware tooling installed."
 echo
-echo "Next steps:"
-echo "  1. Stash OAuth credentials in /root/.tailscale/oauth (see README)"
-echo "  2. Run preflight:         tupperware-preflight"
-echo "  3. Build the template:    tupperware-build-template"
-echo "  4. Install the web UI:    curl -fsSL $REPO_RAW/scripts/install-webui.sh | bash"
+echo "==== TEMPLATE REQUIRED ===="
+echo "Tupperware needs an LXC template at VMID 9000 before it can clone containers."
+echo "Choose ONE of:"
 echo
-echo "To remove later:            tupperware-uninstall"
+echo "  1. Download pre-built template (~2 min, easiest):"
+echo "     tupperware-import-template"
+echo
+echo "  2. Build from scratch (~4 min):"
+echo "     tupperware-build-template"
+echo
+echo "  3. Use your existing template:"
+echo "     Edit /etc/systemd/system/tupperware.service and set TEMPLATE_VMID"
+echo
+echo "Then install the web UI:"
+echo "  curl -fsSL $REPO_RAW/scripts/install-webui.sh | bash"
