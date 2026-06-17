@@ -1,80 +1,76 @@
 #!/bin/bash
-# Tupperware installer — drops CLI scripts into /usr/local/sbin.
-# Safe to re-run; overwrites existing scripts in place.
+# Tupperware installer v0.2
 
 set -euo pipefail
 
 REPO_RAW="${TUPPERWARE_REPO_RAW:-https://raw.githubusercontent.com/SuperAngryMonkey/tupperware/main}"
 
-if [[ $EUID -ne 0 ]]; then
-    echo "ERROR: must run as root" >&2
-    exit 1
-fi
+if [[ $EUID -ne 0 ]]; then echo "ERROR: must run as root" >&2; exit 1; fi
 
-echo "[*] Tupperware installer"
+echo "[*] Tupperware installer v0.2"
 echo
 
-if ! command -v pct >/dev/null 2>&1; then
-    echo "ERROR: pct not found. This must run on a Proxmox VE host." >&2
-    exit 1
-fi
-if ! command -v pveam >/dev/null 2>&1; then
-    echo "ERROR: pveam not found. This must run on a Proxmox VE host." >&2
-    exit 1
-fi
+if ! command -v pct >/dev/null 2>&1; then echo "ERROR: pct not found. Proxmox VE required." >&2; exit 1; fi
 
-# Clean up legacy install (older versions used different script names)
+# Cleanup legacy
 for legacy in build-tailscale-template.sh new-tailscale-ct.sh; do
-    if [[ -f /usr/local/sbin/$legacy ]]; then
-        echo "[*] Removing legacy script: $legacy"
-        rm -f /usr/local/sbin/$legacy
-    fi
+    [[ -f /usr/local/sbin/$legacy ]] && rm -f /usr/local/sbin/$legacy && echo "[*] Removed legacy: $legacy"
 done
 
 INSTALL_FROM_LOCAL=0
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "$SCRIPT_DIR/tupperware-build-template.sh" && -f "$SCRIPT_DIR/tupperware-new.sh" ]]; then
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "")"
+if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/tupperware-new.sh" ]]; then
     INSTALL_FROM_LOCAL=1
-    echo "[*] Installing from local checkout: $SCRIPT_DIR"
+    echo "[*] Installing from local: $SCRIPT_DIR"
 else
     echo "[*] Installing from $REPO_RAW"
 fi
 
 install_script() {
-    local name="$1"
-    local target="/usr/local/sbin/${name%.sh}"
+    local name="$1" target="/usr/local/sbin/${1%.sh}"
     if [[ $INSTALL_FROM_LOCAL -eq 1 && -f "$SCRIPT_DIR/$name" ]]; then
         cp "$SCRIPT_DIR/$name" "$target"
     else
-        curl -fsSL "$REPO_RAW/scripts/$name" -o "$target"
+        curl -fsSL "$REPO_RAW/scripts/$name" -o "$target" || { echo "    [!] Failed: $name"; return 0; }
     fi
     chmod +x "$target"
     echo "    [+] $target"
 }
 
 echo "[*] Installing scripts..."
-install_script tupperware-preflight.sh || true
+install_script tupperware-preflight.sh
 install_script tupperware-new.sh
 install_script tupperware-build-template.sh
 install_script tupperware-import-template.sh
 install_script tupperware-export-template.sh
-install_script tupperware-uninstall.sh || true
+install_script tupperware-transfer.sh
+install_script tupperware-rejoin.sh
+install_script tupperware-uninstall.sh
+
+# Create log directory for transfer audit log
+mkdir -p /var/log/tupperware
+chmod 750 /var/log/tupperware
+
+# Logrotate
+cat > /etc/logrotate.d/tupperware <<'EOF'
+/var/log/tupperware/*.log {
+    monthly
+    rotate 12
+    compress
+    missingok
+    notifempty
+}
+EOF
 
 echo
 echo "[OK] Tupperware tooling installed."
 echo
-echo "==== TEMPLATE REQUIRED ===="
-echo "Tupperware needs an LXC template at VMID 9000 before it can clone containers."
-echo "Choose ONE of:"
+echo "==== NEXT STEPS ===="
+echo "  1. Stash OAuth at /root/.tailscale/oauth (chmod 600)"
+echo "  2. tupperware-import-template     # get a template"
+echo "  3. Install web UI: curl -fsSL $REPO_RAW/scripts/install-webui.sh | bash"
 echo
-echo "  1. Download pre-built template (~2 min, easiest):"
-echo "     tupperware-import-template"
-echo
-echo "  2. Build from scratch (~4 min):"
-echo "     tupperware-build-template"
-echo
-echo "  3. Use your existing template:"
-echo "     Edit /etc/systemd/system/tupperware.service and set TEMPLATE_VMID"
-echo
-echo "Then install the web UI:"
-echo "  curl -fsSL $REPO_RAW/scripts/install-webui.sh | bash"
+echo "For v0.2 transfer:"
+echo "  - Tag BOTH Proxmox hosts as 'tag:prox-host' in Tailscale admin"
+echo "  - Add ACL grant for tag:prox-host SSH"
+echo "  - See docs/v0.2-transfer.md"

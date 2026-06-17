@@ -1,41 +1,36 @@
 #!/usr/bin/env python3
-"""Tupperware - Tailscale-connected LXC container provisioner."""
+"""Tupperware v0.2 - LXC provisioner + host-to-host transfer."""
 import subprocess
 import re
 import os
 import json
-from flask import Flask, render_template_string, request, Response, stream_with_context
+import time
+from flask import Flask, render_template_string, request, Response, stream_with_context, jsonify
 
 app = Flask(__name__)
 
 CLONE_SCRIPT = "/usr/local/sbin/tupperware-new"
+TRANSFER_SCRIPT = "/usr/local/sbin/tupperware-transfer"
 DEFAULT_STORAGE = "local-lvm"
 TEMPLATE_VMID = int(os.environ.get("TEMPLATE_VMID", "9000"))
+OAUTH_FILE = "/root/.tailscale/oauth"
+TRANSFER_LOG = "/var/log/tupperware/transfer.log"
 SAMPLE_TEMPLATE_URL = "https://github.com/SuperAngryMonkey/tupperware/releases/latest/download/tupperware-template.tar.zst"
+
+# Cache for prox-hosts (60s TTL)
+_PROX_HOSTS_CACHE = {"ts": 0, "data": None}
 
 
 def template_exists():
-    """Return True if TEMPLATE_VMID exists and is a template."""
     try:
-        subprocess.check_output(
-            ["pct", "status", str(TEMPLATE_VMID)],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        )
+        subprocess.check_output(["pct", "status", str(TEMPLATE_VMID)], stderr=subprocess.DEVNULL, text=True, timeout=5)
     except Exception:
         return False
-    # status exists; check it's actually a template
     try:
-        out = subprocess.check_output(
-            ["pct", "config", str(TEMPLATE_VMID)],
-            text=True,
-            timeout=5,
-        )
+        out = subprocess.check_output(["pct", "config", str(TEMPLATE_VMID)], text=True, timeout=5)
         for line in out.split("\n"):
             if line.startswith("template:"):
-                val = line.split(":", 1)[1].strip()
-                return val == "1"
+                return line.split(":", 1)[1].strip() == "1"
     except Exception:
         pass
     return False
@@ -49,60 +44,41 @@ def next_free_vmid(start=200):
             for line in out.strip().split("\n")[1:]:
                 parts = line.split()
                 if parts:
-                    try:
-                        used.add(int(parts[0]))
-                    except ValueError:
-                        pass
-        except Exception:
-            pass
+                    try: used.add(int(parts[0]))
+                    except ValueError: pass
+        except Exception: pass
     v = start
-    while v in used:
-        v += 1
+    while v in used: v += 1
     return v
 
 
 def list_storage_backends():
     backends = []
     try:
-        out = subprocess.check_output(
-            ["pvesm", "status", "-content", "rootdir"],
-            text=True, timeout=5
-        )
+        out = subprocess.check_output(["pvesm", "status", "-content", "rootdir"], text=True, timeout=5)
         for line in out.strip().split("\n")[1:]:
             parts = line.split()
             if len(parts) >= 2:
-                backends.append({
-                    "name": parts[0],
-                    "type": parts[1],
-                    "active": parts[2] if len(parts) > 2 else "?",
-                })
-    except Exception:
-        pass
+                backends.append({"name": parts[0], "type": parts[1], "active": parts[2] if len(parts) > 2 else "?"})
+    except Exception: pass
     return backends
 
 
 def host_metrics():
-    try:
-        ct_count = len(subprocess.check_output(["pct", "list"], text=True).strip().split("\n")) - 1
-    except Exception:
-        ct_count = "?"
-    try:
-        vm_count = len(subprocess.check_output(["qm", "list"], text=True).strip().split("\n")) - 1
-    except Exception:
-        vm_count = "?"
+    try: ct_count = len(subprocess.check_output(["pct", "list"], text=True).strip().split("\n")) - 1
+    except Exception: ct_count = "?"
+    try: vm_count = len(subprocess.check_output(["qm", "list"], text=True).strip().split("\n")) - 1
+    except Exception: vm_count = "?"
     try:
         ts_data = json.loads(subprocess.check_output(["tailscale", "status", "--json"], text=True, timeout=3))
         ts_self = ts_data.get("Self", {}).get("HostName", "?")
         ts_peers = len(ts_data.get("Peer", {}))
     except Exception:
-        ts_self = "offline"
-        ts_peers = "?"
-    try:
-        hostname = subprocess.check_output(["hostname"], text=True).strip()
-    except Exception:
-        hostname = "proxmox"
-    return {"ct_count": ct_count, "vm_count": vm_count, "ts_self": ts_self,
-            "ts_peers": ts_peers, "hostname": hostname, "next_vmid": next_free_vmid()}
+        ts_self = "offline"; ts_peers = "?"
+    try: hostname = subprocess.check_output(["hostname"], text=True).strip()
+    except Exception: hostname = "proxmox"
+    return {"ct_count": ct_count, "vm_count": vm_count, "ts_self": ts_self, "ts_peers": ts_peers,
+            "hostname": hostname, "next_vmid": next_free_vmid()}
 
 
 def parse_pct_config(vmid):
@@ -113,85 +89,179 @@ def parse_pct_config(vmid):
             if ":" in line:
                 k, _, v = line.partition(":")
                 cfg[k.strip()] = v.strip()
-    except Exception:
-        pass
+    except Exception: pass
     return cfg
 
 
 def container_ip(vmid):
     try:
-        out = subprocess.check_output(
-            ["pct", "exec", str(vmid), "--", "hostname", "-I"],
-            text=True, timeout=3, stderr=subprocess.DEVNULL
-        )
+        out = subprocess.check_output(["pct", "exec", str(vmid), "--", "hostname", "-I"],
+                                      text=True, timeout=3, stderr=subprocess.DEVNULL)
         ips = out.strip().split()
         for ip in ips:
-            if not ip.startswith("100."):
-                return ip
+            if not ip.startswith("100."): return ip
         return ips[0] if ips else ""
-    except Exception:
-        return ""
+    except Exception: return ""
 
 
 def container_tailnet_ip(vmid):
     try:
-        out = subprocess.check_output(
-            ["pct", "exec", str(vmid), "--", "tailscale", "ip", "-4"],
-            text=True, timeout=3, stderr=subprocess.DEVNULL
-        )
+        out = subprocess.check_output(["pct", "exec", str(vmid), "--", "tailscale", "ip", "-4"],
+                                      text=True, timeout=3, stderr=subprocess.DEVNULL)
         return out.strip().split("\n")[0] if out.strip() else ""
-    except Exception:
-        return ""
+    except Exception: return ""
 
 
 def container_storage(cfg):
     rootfs = cfg.get("rootfs", "")
-    if ":" in rootfs:
-        return rootfs.split(":", 1)[0]
-    return ""
+    return rootfs.split(":", 1)[0] if ":" in rootfs else ""
 
 
 def list_containers():
     containers = []
     try:
         out = subprocess.check_output(["pct", "list"], text=True, timeout=5)
-        lines = out.strip().split("\n")[1:]
-        for line in lines:
+        for line in out.strip().split("\n")[1:]:
             parts = line.split(None, 3)
-            if len(parts) < 3:
-                continue
-            vmid = parts[0]
-            status = parts[1]
+            if len(parts) < 3: continue
+            vmid = parts[0]; status = parts[1]
             name = parts[2] if len(parts) > 2 else ""
             cfg = parse_pct_config(vmid)
-            if cfg.get("template") == "1":
-                continue
-            desc = cfg.get("description", "")
-            desc = desc.replace("%0A", "\n").replace("%20", " ")
-            tags = cfg.get("tags", "")
+            if cfg.get("template") == "1": continue
+            desc = cfg.get("description", "").replace("%0A", "\n").replace("%20", " ")
             rootfs = cfg.get("rootfs", "")
             disk_size = ""
-            disk_match = re.search(r"size=(\S+)", rootfs)
-            if disk_match:
-                disk_size = disk_match.group(1)
+            m = re.search(r"size=(\S+)", rootfs)
+            if m: disk_size = m.group(1)
             lan_ip = container_ip(vmid) if status == "running" else ""
             ts_ip = container_tailnet_ip(vmid) if status == "running" else ""
             containers.append({
-                "vmid": vmid,
-                "name": name,
-                "status": status,
-                "cores": cfg.get("cores", "?"),
-                "memory": cfg.get("memory", "?"),
-                "disk": disk_size,
-                "storage": container_storage(cfg),
-                "lan_ip": lan_ip,
-                "ts_ip": ts_ip,
-                "description": desc,
-                "tags": tags,
+                "vmid": vmid, "name": name, "status": status,
+                "cores": cfg.get("cores", "?"), "memory": cfg.get("memory", "?"),
+                "disk": disk_size, "storage": container_storage(cfg),
+                "lan_ip": lan_ip, "ts_ip": ts_ip,
+                "description": desc, "tags": cfg.get("tags", ""),
             })
-    except Exception:
-        pass
+    except Exception: pass
     return containers
+
+
+def get_oauth_token():
+    """Get an OAuth access token from credentials file."""
+    if not os.path.exists(OAUTH_FILE): return None
+    creds = {}
+    with open(OAUTH_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                creds[k.strip()] = v.strip().strip('"').strip("'")
+    cid = creds.get("TS_OAUTH_CLIENT_ID"); csec = creds.get("TS_OAUTH_CLIENT_SECRET")
+    if not cid or not csec: return None
+    try:
+        r = subprocess.run([
+            "curl", "-fsS",
+            "-d", f"client_id={cid}",
+            "-d", f"client_secret={csec}",
+            "-d", "grant_type=client_credentials",
+            "https://api.tailscale.com/api/v2/oauth/token"
+        ], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0: return None
+        data = json.loads(r.stdout)
+        return data.get("access_token")
+    except Exception: return None
+
+
+def list_prox_hosts():
+    """Return list of Tailscale devices tagged tag:prox-host, excluding self."""
+    now = time.time()
+    if _PROX_HOSTS_CACHE["data"] is not None and (now - _PROX_HOSTS_CACHE["ts"]) < 60:
+        return _PROX_HOSTS_CACHE["data"]
+
+    token = get_oauth_token()
+    if not token: return []
+
+    try:
+        # Query the tailnet devices endpoint
+        r = subprocess.run([
+            "curl", "-fsS",
+            "-H", f"Authorization: Bearer {token}",
+            "https://api.tailscale.com/api/v2/tailnet/-/devices"
+        ], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0: return []
+        data = json.loads(r.stdout)
+    except Exception:
+        return []
+
+    # Get self FQDN to exclude
+    try:
+        self_data = json.loads(subprocess.check_output(["tailscale", "status", "--json"], text=True, timeout=3))
+        self_fqdn = self_data.get("Self", {}).get("DNSName", "").rstrip(".")
+    except Exception:
+        self_fqdn = ""
+
+    hosts = []
+    for d in data.get("devices", []):
+        tags = d.get("tags", []) or []
+        if "tag:prox-host" not in tags: continue
+        fqdn = d.get("name", "").rstrip(".")
+        if fqdn == self_fqdn: continue
+        hosts.append({
+            "name": d.get("hostname", fqdn.split(".")[0]),
+            "fqdn": fqdn,
+            "ip": (d.get("addresses") or [""])[0],
+            "online": (now - _parse_iso(d.get("lastSeen", ""))) < 300 if d.get("lastSeen") else False,
+        })
+
+    _PROX_HOSTS_CACHE["ts"] = now
+    _PROX_HOSTS_CACHE["data"] = hosts
+    return hosts
+
+
+def _parse_iso(s):
+    if not s: return 0
+    try:
+        # Tailscale uses ISO 8601 with Z suffix
+        from datetime import datetime
+        s = s.replace("Z", "+00:00")
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return 0
+
+
+def get_dest_storage(dest_fqdn):
+    """SSH to a destination prox-host and list its storage backends."""
+    if not re.match(r"^[a-zA-Z0-9\.\-]+$", dest_fqdn): return []
+    try:
+        r = subprocess.run([
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            "-o", "StrictHostKeyChecking=accept-new",
+            f"root@{dest_fqdn}",
+            "pvesm status -content rootdir 2>/dev/null | awk 'NR>1 {print $1\":\"$2}'"
+        ], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0: return []
+        backends = []
+        for line in r.stdout.strip().split("\n"):
+            if ":" in line:
+                name, _, typ = line.partition(":")
+                backends.append({"name": name.strip(), "type": typ.strip()})
+        return backends
+    except Exception: return []
+
+
+def transfer_history(limit=10):
+    """Read last N transfer log entries from JSON log file."""
+    if not os.path.exists(TRANSFER_LOG): return []
+    entries = []
+    try:
+        with open(TRANSFER_LOG) as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try: entries.append(json.loads(line))
+                except Exception: pass
+    except Exception: pass
+    return list(reversed(entries))[:limit]
 
 
 SHARED_STYLE = r"""
@@ -213,144 +283,54 @@ body{padding:20px;max-width:1400px;margin:0 auto;}
 .panel{background:var(--c2);border:var(--border);padding:16px;margin-bottom:16px;}
 .panel-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:8px;border-bottom:var(--border-subtle);}
 .panel-title{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--txt2);}
-"""
-
-
-SETUP_PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>TUPPERWARE - SETUP REQUIRED</title>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Bebas+Neue&display=swap" rel="stylesheet">
-<style>
-""" + SHARED_STYLE + r"""
-.setup-banner{background:var(--c2);border:1px solid var(--acc2);padding:24px;margin-bottom:20px;}
-.setup-title{font-family:var(--fdisplay);font-size:28px;letter-spacing:3px;color:var(--acc2);margin-bottom:8px;}
-.setup-msg{color:var(--txt);font-size:13px;line-height:1.6;margin-bottom:12px;}
-.setup-detail{color:var(--txt2);font-size:11px;line-height:1.6;}
-.opt-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px;}
-@media (max-width:900px){.opt-grid{grid-template-columns:1fr;}}
-.opt{background:var(--c2);border:var(--border);padding:20px;}
-.opt-num{font-family:var(--fdisplay);font-size:36px;color:var(--acc);line-height:1;margin-bottom:8px;}
-.opt-name{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--txt);margin-bottom:8px;font-weight:500;}
-.opt-desc{font-size:11px;color:var(--txt2);line-height:1.5;margin-bottom:12px;}
-.opt-time{font-size:9px;color:var(--txt3);letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;}
-.opt-cmd{background:#000;border:var(--border);padding:10px 12px;font-family:var(--fmono);font-size:10px;color:var(--acc3);word-break:break-all;line-height:1.5;}
-.opt-cmd-comment{color:var(--txt3);}
-.detail-panel{background:var(--c2);border:var(--border);padding:16px;}
-.detail-title{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--txt2);margin-bottom:12px;padding-bottom:8px;border-bottom:var(--border-subtle);}
-.detail-body{color:var(--txt2);font-size:11px;line-height:1.6;}
-.detail-body code{background:var(--c3);padding:2px 6px;border:var(--border-subtle);color:var(--acc);font-size:10px;}
-</style></head><body>
-<div class="hdr">
-  <div class="hdr-left"><div class="logo">TUPPERWARE</div><div class="subtitle">LXC PROVISIONER // {{ hostname }}</div></div>
-  <div class="hdr-right"><div class="status-dot warn"></div><div class="status-txt warn">SETUP REQUIRED</div></div>
-</div>
-
-<div class="setup-banner">
-  <div class="setup-title">NO TEMPLATE FOUND</div>
-  <div class="setup-msg">Tupperware needs an LXC template at VMID {{ template_vmid }} to clone containers from.</div>
-  <div class="setup-detail">Pick one of the three options below. Once a template exists at VMID {{ template_vmid }}, refresh this page and Tupperware is ready.</div>
-</div>
-
-<div class="opt-grid">
-
-  <div class="opt">
-    <div class="opt-num">1</div>
-    <div class="opt-name">Download sample template</div>
-    <div class="opt-time">Fastest &mdash; ~2 minutes</div>
-    <div class="opt-desc">Download a pre-built Tupperware-ready Debian 12 template from GitHub Releases. Ready to clone immediately.</div>
-    <div class="opt-cmd"><span class="opt-cmd-comment"># On this Proxmox host:</span><br>
-tupperware-import-template
-    </div>
-  </div>
-
-  <div class="opt">
-    <div class="opt-num">2</div>
-    <div class="opt-name">Build from scratch</div>
-    <div class="opt-time">~4 minutes</div>
-    <div class="opt-desc">Build a fresh template using the standard Debian 12 LXC template, with Tailscale and the firstboot service injected.</div>
-    <div class="opt-cmd"><span class="opt-cmd-comment"># On this Proxmox host:</span><br>
-tupperware-build-template
-    </div>
-  </div>
-
-  <div class="opt">
-    <div class="opt-num">3</div>
-    <div class="opt-name">Use your own template</div>
-    <div class="opt-time">Manual</div>
-    <div class="opt-desc">If you have an existing template at a different VMID, point Tupperware at it. (Must have Tailscale + tailscale-firstboot.service installed.)</div>
-    <div class="opt-cmd"><span class="opt-cmd-comment"># Edit /etc/systemd/system/tupperware.service:</span><br>
-Environment=TEMPLATE_VMID=&lt;your-vmid&gt;<br>
-<span class="opt-cmd-comment"># Then:</span><br>
-systemctl daemon-reload<br>
-systemctl restart tupperware
-    </div>
-  </div>
-
-</div>
-
-<div class="detail-panel">
-  <div class="detail-title">WHAT'S A TUPPERWARE-READY TEMPLATE?</div>
-  <div class="detail-body">
-    Any Proxmox LXC template that has:<br>
-    &nbsp;&nbsp;1. Tailscale installed (<code>apt install tailscale</code>)<br>
-    &nbsp;&nbsp;2. A <code>tailscale-firstboot.service</code> systemd unit that reads <code>/etc/tailscale/authkey</code> on boot, runs <code>tailscale up</code>, then self-disables<br>
-    &nbsp;&nbsp;3. Network configured for DHCP on <code>eth0</code><br>
-    &nbsp;&nbsp;4. <code>/dev/net/tun</code> passthrough enabled in the LXC config<br>
-    <br>
-    Both <code>tupperware-import-template</code> (Option 1) and <code>tupperware-build-template</code> (Option 2) produce templates that meet these requirements.
-  </div>
-</div>
-
-</body></html>
-"""
-
-
-INDEX = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>TUPPERWARE</title>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Bebas+Neue&display=swap" rel="stylesheet">
-<style>
-""" + SHARED_STYLE + r"""
-.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;}
-.metric{background:var(--c2);border:var(--border);padding:16px;position:relative;overflow:hidden;}
-.metric::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;}
-.metric.blue::before{background:var(--acc);}
-.metric.orange::before{background:var(--acc2);}
-.metric.green::before{background:var(--acc3);}
-.metric-label{font-size:9px;color:var(--txt2);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;}
-.metric-val{font-family:var(--fdisplay);font-size:36px;letter-spacing:2px;line-height:1;}
-.metric.blue .metric-val{color:var(--acc);}
-.metric.orange .metric-val{color:var(--acc2);}
-.metric.green .metric-val{color:var(--acc3);}
-.metric-sub{font-size:9px;color:var(--txt3);margin-top:4px;}
 .panel-badge{font-size:9px;padding:2px 8px;border:1px solid;letter-spacing:1px;}
 .panel-badge.live{color:var(--acc3);border-color:var(--acc3);}
 .panel-badge.warn{color:var(--acc2);border-color:var(--acc2);}
 .panel-badge.err{color:var(--danger);border-color:var(--danger);}
 .panel-badge.idle{color:var(--txt3);border-color:var(--txt3);}
-.form-grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:12px;}
-.form-grid.row2{grid-template-columns:1fr 1fr 1fr;margin-top:12px;}
-.form-field{display:flex;flex-direction:column;gap:6px;}
-.form-label{font-size:9px;color:var(--txt2);letter-spacing:2px;text-transform:uppercase;}
-.form-input{background:var(--c3);border:var(--border);color:var(--txt);font-family:var(--fmono);font-size:11px;padding:10px 14px;outline:none;}
-.form-input:focus{border-color:var(--acc);}
-.form-input::placeholder{color:var(--txt3);}
-.form-select{background:var(--c3);border:var(--border);color:var(--txt);font-family:var(--fmono);font-size:11px;padding:10px 14px;outline:none;appearance:none;cursor:pointer;}
-.form-select:focus{border-color:var(--acc);}
-.btn-row{margin-top:16px;display:flex;gap:8px;}
 .btn{background:transparent;border:1px solid var(--acc);color:var(--acc);font-family:var(--fmono);font-size:11px;padding:12px 28px;cursor:pointer;letter-spacing:3px;text-transform:uppercase;}
 .btn:hover{background:rgba(0,212,255,0.1);}
 .btn:disabled{opacity:0.4;cursor:not-allowed;}
 .btn-small{padding:6px 14px;font-size:9px;letter-spacing:2px;}
+.btn-xfer{padding:4px 10px;font-size:9px;letter-spacing:1px;border-color:var(--acc2);color:var(--acc2);}
+.btn-xfer:hover{background:rgba(255,107,53,0.1);}
+.form-input{background:var(--c3);border:var(--border);color:var(--txt);font-family:var(--fmono);font-size:11px;padding:10px 14px;outline:none;width:100%;}
+.form-input:focus{border-color:var(--acc);}
+.form-select{background:var(--c3);border:var(--border);color:var(--txt);font-family:var(--fmono);font-size:11px;padding:10px 14px;outline:none;appearance:none;cursor:pointer;width:100%;}
+.form-label{font-size:9px;color:var(--txt2);letter-spacing:2px;text-transform:uppercase;display:block;margin-bottom:6px;}
 .console{background:#000;border:var(--border);padding:14px;min-height:200px;max-height:480px;overflow-y:auto;font-family:var(--fmono);font-size:11px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word;}
-.console .ok{color:var(--acc3);}
-.console .info{color:var(--acc);}
-.console .warn{color:var(--acc2);}
-.console .err{color:var(--danger);}
-.console .dim{color:var(--txt3);}
+.console .ok{color:var(--acc3);} .console .info{color:var(--acc);} .console .warn{color:var(--acc2);} .console .err{color:var(--danger);} .console .dim{color:var(--txt3);}
 .console-empty{color:var(--txt3);font-style:italic;}
+"""
+
+
+# Setup page (template not found) — same as v0.1.5
+SETUP_PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>TUPPERWARE SETUP</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Bebas+Neue&display=swap" rel="stylesheet">
+<style>""" + SHARED_STYLE + r""" .setup-banner{background:var(--c2);border:1px solid var(--acc2);padding:24px;margin-bottom:20px;} .setup-title{font-family:var(--fdisplay);font-size:28px;letter-spacing:3px;color:var(--acc2);margin-bottom:8px;}</style></head><body>
+<div class="hdr"><div class="hdr-left"><div class="logo">TUPPERWARE</div><div class="subtitle">SETUP REQUIRED // {{ hostname }}</div></div><div class="hdr-right"><div class="status-dot warn"></div><div class="status-txt warn">SETUP REQUIRED</div></div></div>
+<div class="setup-banner"><div class="setup-title">NO TEMPLATE FOUND</div><div>Tupperware needs an LXC template at VMID {{ template_vmid }}.</div></div>
+<div class="panel"><div class="panel-title">RUN ONE OF:</div><pre style="color:var(--acc3);font-size:13px;padding:12px;">tupperware-import-template   # easiest, ~2 min
+tupperware-build-template    # build from scratch, ~4 min</pre></div></body></html>"""
+
+
+INDEX = r"""<!doctype html><html><head><meta charset="utf-8"><title>TUPPERWARE</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Bebas+Neue&display=swap" rel="stylesheet">
+<style>""" + SHARED_STYLE + r"""
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;}
+.metric{background:var(--c2);border:var(--border);padding:16px;position:relative;overflow:hidden;}
+.metric::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;}
+.metric.blue::before{background:var(--acc);} .metric.orange::before{background:var(--acc2);} .metric.green::before{background:var(--acc3);}
+.metric-label{font-size:9px;color:var(--txt2);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;}
+.metric-val{font-family:var(--fdisplay);font-size:36px;letter-spacing:2px;line-height:1;}
+.metric.blue .metric-val{color:var(--acc);} .metric.orange .metric-val{color:var(--acc2);} .metric.green .metric-val{color:var(--acc3);}
+.metric-sub{font-size:9px;color:var(--txt3);margin-top:4px;}
+.form-grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:12px;}
+.form-grid.row2{grid-template-columns:1fr 1fr 1fr;margin-top:12px;}
+.btn-row{margin-top:16px;display:flex;gap:8px;}
 .inv-table{width:100%;border-collapse:collapse;font-size:11px;}
 .inv-table th{text-align:left;padding:8px 10px;font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--txt2);border-bottom:var(--border);font-weight:normal;}
 .inv-table td{padding:10px;border-bottom:var(--border-subtle);vertical-align:top;}
-.inv-table tr:hover td{background:rgba(0,212,255,0.03);}
 .inv-vmid{color:var(--acc);font-weight:500;}
 .inv-name{color:var(--txt);font-weight:500;}
 .inv-status{display:inline-block;padding:2px 8px;border:1px solid;font-size:9px;letter-spacing:1px;}
@@ -358,212 +338,241 @@ INDEX = r"""<!doctype html>
 .inv-status.stopped{color:var(--txt3);border-color:var(--txt3);}
 .inv-ip{font-size:10px;color:var(--txt2);}
 .inv-ip-ts{color:var(--acc);}
-.inv-tags{display:inline-block;padding:1px 6px;border:1px solid var(--acc2);color:var(--acc2);font-size:9px;margin-right:4px;}
 .inv-storage{font-size:10px;color:var(--txt2);}
-.inv-notes{color:var(--txt2);font-size:10px;font-style:italic;max-width:280px;white-space:pre-wrap;}
-.inv-notes-empty{color:var(--txt3);font-style:italic;}
+.inv-notes{color:var(--txt2);font-size:10px;font-style:italic;max-width:240px;}
 .inv-empty{text-align:center;color:var(--txt3);font-style:italic;padding:30px;}
-@media (max-width:900px){.metrics{grid-template-columns:repeat(2,1fr);}.form-grid{grid-template-columns:1fr 1fr;}.form-grid.row2{grid-template-columns:1fr;}.inv-table{font-size:10px;}}
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:100;align-items:center;justify-content:center;}
+.modal-bg.open{display:flex;}
+.modal{background:var(--c2);border:var(--border-strong);padding:24px;width:500px;max-width:90vw;}
+.modal-title{font-family:var(--fdisplay);font-size:24px;letter-spacing:3px;color:var(--acc2);margin-bottom:4px;}
+.modal-sub{font-size:10px;color:var(--txt2);letter-spacing:1px;margin-bottom:16px;}
+.modal-field{margin-bottom:14px;}
+.radio-row{display:flex;gap:8px;}
+.radio-opt{flex:1;background:var(--c3);border:var(--border);padding:10px;cursor:pointer;font-size:10px;}
+.radio-opt.selected{border-color:var(--acc2);color:var(--acc2);}
+.modal-actions{display:flex;gap:8px;margin-top:18px;}
+.btn-cancel{border-color:var(--txt3);color:var(--txt3);}
+.btn-cancel:hover{background:rgba(255,255,255,0.05);}
+.btn-go{border-color:var(--acc2);color:var(--acc2);}
+.btn-go:hover{background:rgba(255,107,53,0.1);}
+.hist-table{width:100%;border-collapse:collapse;font-size:10px;}
+.hist-table th{text-align:left;padding:6px 8px;font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--txt2);border-bottom:var(--border);font-weight:normal;}
+.hist-table td{padding:8px;border-bottom:var(--border-subtle);}
+.hist-status.success{color:var(--acc3);} .hist-status.failed{color:var(--danger);} .hist-status.partial{color:var(--acc2);}
 </style></head><body>
-<div class="hdr">
-  <div class="hdr-left"><div class="logo">TUPPERWARE</div><div class="subtitle">LXC PROVISIONER // {{ m.hostname }}</div></div>
-  <div class="hdr-right"><div class="clock" id="clock">--:--:--</div><div class="status-dot"></div><div class="status-txt">OPERATIONAL</div></div>
-</div>
+<div class="hdr"><div class="hdr-left"><div class="logo">TUPPERWARE</div><div class="subtitle">LXC PROVISIONER // {{ m.hostname }}</div></div>
+<div class="hdr-right"><div class="clock" id="clock">--:--:--</div><div class="status-dot"></div><div class="status-txt">OPERATIONAL</div></div></div>
+
 <div class="metrics">
   <div class="metric blue"><div class="metric-label">CONTAINERS</div><div class="metric-val">{{ m.ct_count }}</div><div class="metric-sub">LXC on host</div></div>
-  <div class="metric orange"><div class="metric-label">VIRTUAL MACHINES</div><div class="metric-val">{{ m.vm_count }}</div><div class="metric-sub">QEMU on host</div></div>
+  <div class="metric orange"><div class="metric-label">VMS</div><div class="metric-val">{{ m.vm_count }}</div><div class="metric-sub">QEMU on host</div></div>
   <div class="metric green"><div class="metric-label">TAILNET PEERS</div><div class="metric-val">{{ m.ts_peers }}</div><div class="metric-sub">visible from {{ m.ts_self }}</div></div>
-  <div class="metric blue"><div class="metric-label">NEXT VMID</div><div class="metric-val">{{ m.next_vmid }}</div><div class="metric-sub">auto-pick available</div></div>
+  <div class="metric blue"><div class="metric-label">NEXT VMID</div><div class="metric-val">{{ m.next_vmid }}</div><div class="metric-sub">auto-pick</div></div>
 </div>
-<div class="panel">
-  <div class="panel-hdr"><div class="panel-title">CLONE PARAMETERS</div><div class="panel-badge idle" id="form-status">READY</div></div>
-  <form id="clone-form">
-    <div class="form-grid">
-      <div class="form-field"><div class="form-label">HOSTNAME</div><input class="form-input" type="text" name="hostname" required placeholder="lab-lxc-01" pattern="[a-zA-Z0-9\-]+" autofocus></div>
-      <div class="form-field"><div class="form-label">VMID</div><input class="form-input" type="number" name="vmid" placeholder="{{ m.next_vmid }}" min="100" max="999999"></div>
-      <div class="form-field"><div class="form-label">CORES</div><input class="form-input" type="number" name="cores" placeholder="1" min="1" max="16"></div>
-      <div class="form-field"><div class="form-label">MEMORY MB</div><input class="form-input" type="number" name="memory" placeholder="512" min="128"></div>
-      <div class="form-field"><div class="form-label">DISK GB</div><input class="form-input" type="number" name="disk" placeholder="4" min="4"></div>
-    </div>
-    <div class="form-grid row2">
-      <div class="form-field"><div class="form-label">STORAGE BACKEND</div>
-        <select class="form-select" name="storage">
-          {% for s in storages %}
-            <option value="{{ s.name }}"{% if s.name == default_storage %} selected{% endif %}>{{ s.name }} ({{ s.type }})</option>
-          {% endfor %}
-          {% if not storages %}
-            <option value="local-lvm">local-lvm (default)</option>
-          {% endif %}
-        </select>
-      </div>
-      <div class="form-field"><div class="form-label">ROOT PASSWORD (OPTIONAL)</div><input class="form-input" type="password" name="rootpw" placeholder="leave blank for tailscale ssh only" autocomplete="new-password"></div>
-    </div>
-    <div class="btn-row"><button class="btn" type="submit" id="submit-btn">CLONE &amp; JOIN TAILNET</button></div>
-  </form>
-</div>
-<div class="panel">
-  <div class="panel-hdr"><div class="panel-title">PROVISIONING CONSOLE</div><div class="panel-badge idle" id="console-status">IDLE</div></div>
-  <div class="console" id="console"><div class="console-empty">Awaiting clone request...</div></div>
-</div>
-<div class="panel">
-  <div class="panel-hdr"><div class="panel-title">INVENTORY &mdash; {{ containers|length }} CONTAINER{{ '' if containers|length == 1 else 'S' }}</div>
-    <button class="btn btn-small" type="button" onclick="window.location.reload()">REFRESH</button>
+
+<div class="panel"><div class="panel-hdr"><div class="panel-title">CLONE PARAMETERS</div><div class="panel-badge idle" id="form-status">READY</div></div>
+<form id="clone-form">
+  <div class="form-grid">
+    <div><label class="form-label">HOSTNAME</label><input class="form-input" type="text" name="hostname" required placeholder="lab-lxc-01" pattern="[a-zA-Z0-9\-]+" autofocus></div>
+    <div><label class="form-label">VMID</label><input class="form-input" type="number" name="vmid" placeholder="{{ m.next_vmid }}"></div>
+    <div><label class="form-label">CORES</label><input class="form-input" type="number" name="cores" placeholder="1"></div>
+    <div><label class="form-label">MEMORY MB</label><input class="form-input" type="number" name="memory" placeholder="512"></div>
+    <div><label class="form-label">DISK GB</label><input class="form-input" type="number" name="disk" placeholder="4"></div>
   </div>
-  {% if containers %}
-  <table class="inv-table">
-    <thead>
-      <tr>
-        <th>VMID</th>
-        <th>HOSTNAME</th>
-        <th>STATUS</th>
-        <th>CPU / MEM / DISK</th>
-        <th>STORAGE</th>
-        <th>NETWORK</th>
-        <th>TAGS</th>
-        <th>NOTES</th>
-      </tr>
-    </thead>
-    <tbody>
-    {% for c in containers %}
-      <tr>
-        <td class="inv-vmid">{{ c.vmid }}</td>
-        <td class="inv-name">{{ c.name }}</td>
-        <td><span class="inv-status {{ c.status }}">{{ c.status }}</span></td>
-        <td>{{ c.cores }}c / {{ c.memory }}MB / {{ c.disk }}</td>
-        <td class="inv-storage">{{ c.storage or '—' }}</td>
-        <td class="inv-ip">
-          {% if c.lan_ip %}{{ c.lan_ip }}<br>{% endif %}
-          {% if c.ts_ip %}<span class="inv-ip-ts">{{ c.ts_ip }}</span>{% endif %}
-        </td>
-        <td>
-          {% if c.tags %}
-            {% for t in c.tags.split(';') %}
-              {% if t %}<span class="inv-tags">{{ t }}</span>{% endif %}
-            {% endfor %}
-          {% else %}<span class="inv-notes-empty">&mdash;</span>{% endif %}
-        </td>
-        <td class="inv-notes">{% if c.description %}{{ c.description }}{% else %}<span class="inv-notes-empty">&mdash;</span>{% endif %}</td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
-  {% else %}
-  <div class="inv-empty">No containers found.</div>
-  {% endif %}
-</div>
+  <div class="form-grid row2">
+    <div><label class="form-label">STORAGE BACKEND</label><select class="form-select" name="storage">
+      {% for s in storages %}<option value="{{ s.name }}"{% if s.name == default_storage %} selected{% endif %}>{{ s.name }} ({{ s.type }})</option>{% endfor %}
+    </select></div>
+    <div><label class="form-label">ROOT PASSWORD (OPTIONAL)</label><input class="form-input" type="password" name="rootpw" placeholder="leave blank for tailscale ssh only" autocomplete="new-password"></div>
+  </div>
+  <div class="btn-row"><button class="btn" type="submit" id="submit-btn">CLONE &amp; JOIN TAILNET</button></div>
+</form></div>
+
+<div class="panel"><div class="panel-hdr"><div class="panel-title">PROVISIONING CONSOLE</div><div class="panel-badge idle" id="console-status">IDLE</div></div>
+<div class="console" id="console"><div class="console-empty">Awaiting request...</div></div></div>
+
+<div class="panel"><div class="panel-hdr"><div class="panel-title">INVENTORY &mdash; {{ containers|length }} CONTAINER{{ '' if containers|length == 1 else 'S' }}</div>
+<button class="btn btn-small" type="button" onclick="window.location.reload()">REFRESH</button></div>
+{% if containers %}<table class="inv-table"><thead><tr>
+<th>VMID</th><th>HOSTNAME</th><th>STATUS</th><th>CPU/MEM/DISK</th><th>STORAGE</th><th>NETWORK</th><th>NOTES</th><th></th>
+</tr></thead><tbody>
+{% for c in containers %}<tr>
+<td class="inv-vmid">{{ c.vmid }}</td>
+<td class="inv-name">{{ c.name }}</td>
+<td><span class="inv-status {{ c.status }}">{{ c.status }}</span></td>
+<td>{{ c.cores }}c / {{ c.memory }}MB / {{ c.disk }}</td>
+<td class="inv-storage">{{ c.storage or '—' }}</td>
+<td class="inv-ip">{% if c.lan_ip %}{{ c.lan_ip }}<br>{% endif %}{% if c.ts_ip %}<span class="inv-ip-ts">{{ c.ts_ip }}</span>{% endif %}</td>
+<td class="inv-notes">{{ c.description or '—' }}</td>
+<td><button class="btn btn-xfer" type="button" onclick="openTransfer('{{ c.vmid }}','{{ c.name }}')">TRANSFER</button></td>
+</tr>{% endfor %}
+</tbody></table>{% else %}<div class="inv-empty">No containers found.</div>{% endif %}</div>
+
+<div class="panel"><div class="panel-hdr"><div class="panel-title">TRANSFER HISTORY (LAST 10)</div></div>
+{% if history %}<table class="hist-table"><thead><tr>
+<th>WHEN</th><th>SOURCE</th><th>DESTINATION</th><th>IDENTITY</th><th>SIZE</th><th>DURATION</th><th>STATUS</th>
+</tr></thead><tbody>
+{% for h in history %}<tr>
+<td>{{ h.ts }}</td>
+<td>{{ h.src_vmid }} ({{ h.src_hostname }})</td>
+<td>{{ h.dest_host }}{% if h.dest_vmid %} → {{ h.dest_vmid }}{% endif %}</td>
+<td>{{ h.identity }}</td>
+<td>{% if h.size_bytes %}{{ (h.size_bytes/1024/1024)|round(1) }}MB{% else %}—{% endif %}</td>
+<td>{{ h.duration_seconds }}s</td>
+<td class="hist-status {{ h.status }}">{{ h.status|upper }}</td>
+</tr>{% endfor %}
+</tbody></table>{% else %}<div class="inv-empty">No transfers recorded yet.</div>{% endif %}</div>
+
+<!-- Transfer modal -->
+<div class="modal-bg" id="xfer-modal"><div class="modal">
+<div class="modal-title">TRANSFER CONTAINER</div>
+<div class="modal-sub" id="xfer-src">VMID — (—)</div>
+<div class="modal-field"><label class="form-label">DESTINATION HOST</label>
+<select class="form-select" id="xfer-dest" onchange="loadDestStorage()"><option value="">Loading...</option></select></div>
+<div class="modal-field"><label class="form-label">DESTINATION STORAGE</label>
+<select class="form-select" id="xfer-storage"><option value="">Select destination first</option></select></div>
+<div class="modal-field"><label class="form-label">IDENTITY</label>
+<div class="radio-row">
+<div class="radio-opt selected" id="id-fresh" onclick="selectIdentity('fresh')">FRESH<br><span style="color:var(--txt3);">new tailnet IP</span></div>
+<div class="radio-opt" id="id-preserve" onclick="selectIdentity('preserve')">PRESERVE<br><span style="color:var(--txt3);">same machine key</span></div>
+</div></div>
+<div class="modal-actions">
+<button class="btn btn-cancel" type="button" onclick="closeTransfer()">CANCEL</button>
+<button class="btn btn-go" type="button" id="xfer-go" onclick="startTransfer()">TRANSFER</button>
+</div></div></div>
+
 <script>
 const NL = String.fromCharCode(10);
-function tick(){var d=new Date();var p=function(n){return String(n).padStart(2,'0');};document.getElementById('clock').textContent=p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());}
+let xferVmid = '', xferName = '', xferIdentity = 'fresh';
+
+function tick(){var d=new Date(),p=n=>String(n).padStart(2,'0');document.getElementById('clock').textContent=p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());}
 setInterval(tick,1000);tick();
-var form=document.getElementById('clone-form');
-var submitBtn=document.getElementById('submit-btn');
-var consoleEl=document.getElementById('console');
-var formStatus=document.getElementById('form-status');
-var consoleStatus=document.getElementById('console-status');
+
 function setStatus(el,cls,text){el.className='panel-badge '+cls;el.textContent=text;}
-function appendLine(text,cls){if(consoleEl.querySelector('.console-empty'))consoleEl.innerHTML='';var span=document.createElement('span');span.className=cls||'';span.textContent=text+NL;consoleEl.appendChild(span);consoleEl.scrollTop=consoleEl.scrollHeight;}
-function classifyLine(line){if(/All done|ready|success|\[OK\]/i.test(line))return 'ok';if(/ERROR|failed|exception/i.test(line))return 'err';if(/WARN|warning|abandoning|conflict/i.test(line))return 'warn';if(/^\[\*\]/.test(line))return 'info';return 'dim';}
-form.addEventListener('submit',async function(e){
+function appendLine(text,cls){var c=document.getElementById('console');if(c.querySelector('.console-empty'))c.innerHTML='';var s=document.createElement('span');s.className=cls||'';s.textContent=text+NL;c.appendChild(s);c.scrollTop=c.scrollHeight;}
+function classifyLine(line){if(/\[OK\]|All done|success/i.test(line))return 'ok';if(/ERROR|failed|exception/i.test(line))return 'err';if(/WARN|warning/i.test(line))return 'warn';if(/^\[\*\]/.test(line))return 'info';return 'dim';}
+
+document.getElementById('clone-form').addEventListener('submit',async function(e){
   e.preventDefault();
-  consoleEl.innerHTML='';
-  submitBtn.disabled=true;
-  setStatus(formStatus,'warn','BUSY');
-  setStatus(consoleStatus,'live','STREAMING');
-  var fd=new FormData(form);
-  var params=new URLSearchParams();
-  fd.forEach(function(v,k){params.append(k,v);});
+  var consoleEl=document.getElementById('console');consoleEl.innerHTML='';
+  var submitBtn=document.getElementById('submit-btn');submitBtn.disabled=true;
+  setStatus(document.getElementById('form-status'),'warn','BUSY');
+  setStatus(document.getElementById('console-status'),'live','STREAMING');
+  var fd=new FormData(e.target),params=new URLSearchParams();
+  fd.forEach((v,k)=>params.append(k,v));
   try{
     var resp=await fetch('/clone-stream',{method:'POST',body:params});
-    if(!resp.ok||!resp.body)throw new Error('Stream init failed: '+resp.status);
-    var reader=resp.body.getReader();
-    var decoder=new TextDecoder();
-    var buffer='';
-    while(true){
-      var chunk=await reader.read();
-      if(chunk.done)break;
-      buffer+=decoder.decode(chunk.value,{stream:true});
-      var nl;
-      while((nl=buffer.indexOf(NL))>=0){
-        var line=buffer.slice(0,nl);
-        buffer=buffer.slice(nl+1);
-        if(line.length)appendLine(line,classifyLine(line));
-      }
-    }
+    if(!resp.ok||!resp.body)throw new Error('Stream init failed');
+    var reader=resp.body.getReader(),decoder=new TextDecoder(),buffer='';
+    while(true){var ch=await reader.read();if(ch.done)break;buffer+=decoder.decode(ch.value,{stream:true});var nl;while((nl=buffer.indexOf(NL))>=0){var ln=buffer.slice(0,nl);buffer=buffer.slice(nl+1);if(ln.length)appendLine(ln,classifyLine(ln));}}
     if(buffer.length)appendLine(buffer,classifyLine(buffer));
-    setStatus(formStatus,'live','COMPLETE');
-    setStatus(consoleStatus,'live','DONE');
-  }catch(err){
-    appendLine('[!] '+err.message,'err');
-    setStatus(formStatus,'err','FAILED');
-    setStatus(consoleStatus,'err','ERROR');
-  }finally{
-    submitBtn.disabled=false;
-  }
+    setStatus(document.getElementById('form-status'),'live','COMPLETE');
+    setStatus(document.getElementById('console-status'),'live','DONE');
+  }catch(err){appendLine('[!] '+err.message,'err');setStatus(document.getElementById('form-status'),'err','FAILED');setStatus(document.getElementById('console-status'),'err','ERROR');}
+  finally{submitBtn.disabled=false;}
 });
-</script>
-</body></html>
-"""
+
+async function openTransfer(vmid,name){
+  xferVmid=vmid;xferName=name;xferIdentity='fresh';
+  document.getElementById('xfer-src').textContent='VMID '+vmid+' ('+name+')';
+  selectIdentity('fresh');
+  document.getElementById('xfer-modal').classList.add('open');
+  // Load destination hosts
+  var sel=document.getElementById('xfer-dest');sel.innerHTML='<option value="">Loading...</option>';
+  try{
+    var r=await fetch('/api/prox-hosts');var data=await r.json();
+    if(!data.hosts||!data.hosts.length){sel.innerHTML='<option value="">No prox-hosts found (tag your hosts tag:prox-host)</option>';return;}
+    sel.innerHTML='<option value="">-- Choose destination --</option>';
+    data.hosts.forEach(h=>{var o=document.createElement('option');o.value=h.fqdn;o.textContent=h.name+' ('+h.fqdn+')'+(h.online?'':' [offline]');sel.appendChild(o);});
+  }catch(e){sel.innerHTML='<option value="">Error loading hosts</option>';}
+}
+
+function closeTransfer(){document.getElementById('xfer-modal').classList.remove('open');}
+
+function selectIdentity(id){xferIdentity=id;document.getElementById('id-fresh').classList.toggle('selected',id==='fresh');document.getElementById('id-preserve').classList.toggle('selected',id==='preserve');}
+
+async function loadDestStorage(){
+  var dest=document.getElementById('xfer-dest').value;
+  var sel=document.getElementById('xfer-storage');sel.innerHTML='<option value="">Loading...</option>';
+  if(!dest){sel.innerHTML='<option value="">Select destination first</option>';return;}
+  try{
+    var r=await fetch('/api/dest-storage?dest='+encodeURIComponent(dest));var data=await r.json();
+    if(!data.storages||!data.storages.length){sel.innerHTML='<option value="">No storage found</option>';return;}
+    sel.innerHTML='';
+    data.storages.forEach(s=>{var o=document.createElement('option');o.value=s.name;o.textContent=s.name+' ('+s.type+')';sel.appendChild(o);});
+  }catch(e){sel.innerHTML='<option value="">Error</option>';}
+}
+
+async function startTransfer(){
+  var dest=document.getElementById('xfer-dest').value;var storage=document.getElementById('xfer-storage').value;
+  if(!dest||!storage){alert('Pick destination and storage');return;}
+  closeTransfer();
+  var consoleEl=document.getElementById('console');consoleEl.innerHTML='';
+  setStatus(document.getElementById('console-status'),'live','STREAMING');
+  appendLine('[*] Starting transfer of VMID '+xferVmid+' to '+dest,'info');
+  var params=new URLSearchParams();params.append('vmid',xferVmid);params.append('dest',dest);params.append('storage',storage);params.append('identity',xferIdentity);
+  try{
+    var resp=await fetch('/transfer-stream',{method:'POST',body:params});
+    if(!resp.ok||!resp.body)throw new Error('Stream init failed');
+    var reader=resp.body.getReader(),decoder=new TextDecoder(),buffer='';
+    while(true){var ch=await reader.read();if(ch.done)break;buffer+=decoder.decode(ch.value,{stream:true});var nl;while((nl=buffer.indexOf(NL))>=0){var ln=buffer.slice(0,nl);buffer=buffer.slice(nl+1);if(ln.length)appendLine(ln,classifyLine(ln));}}
+    if(buffer.length)appendLine(buffer,classifyLine(buffer));
+    setStatus(document.getElementById('console-status'),'live','DONE');
+  }catch(err){appendLine('[!] '+err.message,'err');setStatus(document.getElementById('console-status'),'err','ERROR');}
+}
+</script></body></html>"""
 
 
 @app.route("/")
 def index():
     if not template_exists():
-        try:
-            hostname = subprocess.check_output(["hostname"], text=True).strip()
-        except Exception:
-            hostname = "proxmox"
-        return render_template_string(
-            SETUP_PAGE,
-            hostname=hostname,
-            template_vmid=TEMPLATE_VMID,
-            sample_url=SAMPLE_TEMPLATE_URL,
-        )
-    return render_template_string(
-        INDEX,
-        m=host_metrics(),
-        containers=list_containers(),
-        storages=list_storage_backends(),
-        default_storage=DEFAULT_STORAGE,
-    )
+        try: hostname = subprocess.check_output(["hostname"], text=True).strip()
+        except Exception: hostname = "proxmox"
+        return render_template_string(SETUP_PAGE, hostname=hostname, template_vmid=TEMPLATE_VMID)
+    return render_template_string(INDEX,
+        m=host_metrics(), containers=list_containers(),
+        storages=list_storage_backends(), default_storage=DEFAULT_STORAGE,
+        history=transfer_history())
+
+
+@app.route("/api/prox-hosts")
+def api_prox_hosts():
+    return jsonify({"hosts": list_prox_hosts()})
+
+
+@app.route("/api/dest-storage")
+def api_dest_storage():
+    dest = request.args.get("dest", "")
+    return jsonify({"storages": get_dest_storage(dest)})
 
 
 @app.route("/clone-stream", methods=["POST"])
 def clone_stream():
     if not template_exists():
-        return Response("[!] No template found at VMID " + str(TEMPLATE_VMID) + ". Cannot clone.\n", mimetype="text/plain")
-
+        return Response("[!] No template at VMID " + str(TEMPLATE_VMID) + "\n", mimetype="text/plain")
     hostname = request.form.get("hostname", "").strip()
     if not re.match(r"^[a-zA-Z0-9-]+$", hostname):
         return Response("[!] Invalid hostname.\n", mimetype="text/plain")
-    vmid = request.form.get("vmid", "").strip()
-    if not vmid:
-        vmid = str(next_free_vmid())
-    try:
-        vmid_int = int(vmid)
-    except ValueError:
-        return Response("[!] Invalid VMID.\n", mimetype="text/plain")
+    vmid = request.form.get("vmid", "").strip() or str(next_free_vmid())
+    try: vmid_int = int(vmid)
+    except ValueError: return Response("[!] Invalid VMID.\n", mimetype="text/plain")
     cores = request.form.get("cores", "").strip()
     memory = request.form.get("memory", "").strip()
     disk = request.form.get("disk", "").strip()
     rootpw = request.form.get("rootpw", "")
     storage = request.form.get("storage", "").strip() or DEFAULT_STORAGE
-
     if not re.match(r"^[a-zA-Z0-9_\-]+$", storage):
-        return Response("[!] Invalid storage name.\n", mimetype="text/plain")
+        return Response("[!] Invalid storage.\n", mimetype="text/plain")
 
     def generate():
-        yield "[*] Tupperware: cloning " + hostname + " as VMID " + str(vmid_int) + " on storage '" + storage + "'\n"
+        yield "[*] Cloning " + hostname + " as VMID " + str(vmid_int) + "\n"
         try:
-            proc = subprocess.Popen(
-                [CLONE_SCRIPT, str(vmid_int), hostname, "--storage", storage],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-            )
-            for line in iter(proc.stdout.readline, ""):
-                yield line
+            proc = subprocess.Popen([CLONE_SCRIPT, str(vmid_int), hostname, "--storage", storage],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in iter(proc.stdout.readline, ""): yield line
             proc.wait()
             if proc.returncode != 0:
-                yield "[!] Clone script exited with code " + str(proc.returncode) + "\n"
-                return
+                yield "[!] Clone failed (exit " + str(proc.returncode) + ")\n"; return
             if cores or memory:
                 args = ["pct", "set", str(vmid_int)]
                 if cores: args += ["-cores", cores]
@@ -576,15 +585,42 @@ def clone_stream():
                 yield "[*] Resizing rootfs to " + disk + "G...\n"
                 r = subprocess.run(["pct", "resize", str(vmid_int), "rootfs", disk + "G"], capture_output=True, text=True)
                 if r.stdout: yield r.stdout
-                if r.stderr: yield r.stderr
             if rootpw:
                 yield "[*] Setting root password...\n"
-                r = subprocess.run(
-                    ["pct", "exec", str(vmid_int), "--", "bash", "-c", "echo 'root:" + rootpw + "' | chpasswd"],
-                    capture_output=True, text=True,
-                )
-                yield "    Password set.\n" if r.returncode == 0 else "    Failed: " + r.stderr + "\n"
-            yield "\n[OK] All done. " + hostname + " (VMID " + str(vmid_int) + ") should be on the tailnet.\n"
+                subprocess.run(["pct", "exec", str(vmid_int), "--", "bash", "-c", "echo 'root:" + rootpw + "' | chpasswd"],
+                               capture_output=True, text=True)
+            yield "\n[OK] All done.\n"
+        except Exception as e:
+            yield "\n[!] Exception: " + str(e) + "\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/plain")
+
+
+@app.route("/transfer-stream", methods=["POST"])
+def transfer_stream():
+    vmid = request.form.get("vmid", "").strip()
+    dest = request.form.get("dest", "").strip()
+    storage = request.form.get("storage", "").strip()
+    identity = request.form.get("identity", "fresh").strip()
+
+    if not vmid.isdigit():
+        return Response("[!] Invalid VMID.\n", mimetype="text/plain")
+    if not re.match(r"^[a-zA-Z0-9\.\-]+$", dest):
+        return Response("[!] Invalid destination.\n", mimetype="text/plain")
+    if not re.match(r"^[a-zA-Z0-9_\-]+$", storage):
+        return Response("[!] Invalid storage.\n", mimetype="text/plain")
+
+    def generate():
+        args = [TRANSFER_SCRIPT, vmid, dest, "--storage", storage]
+        if identity == "preserve": args.append("--preserve-identity")
+        try:
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in iter(proc.stdout.readline, ""): yield line
+            proc.wait()
+            if proc.returncode != 0:
+                yield "[!] Transfer exited with code " + str(proc.returncode) + "\n"
+            else:
+                yield "\n[OK] Transfer complete.\n"
         except Exception as e:
             yield "\n[!] Exception: " + str(e) + "\n"
 
