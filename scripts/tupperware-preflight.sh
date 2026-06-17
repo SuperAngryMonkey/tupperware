@@ -184,6 +184,17 @@ else
     source "$OAUTH_FILE" 2>/dev/null
     if [[ -z "${TS_OAUTH_CLIENT_ID:-}" || -z "${TS_OAUTH_CLIENT_SECRET:-}" ]]; then
         err "OAuth file missing TS_OAUTH_CLIENT_ID or TS_OAUTH_CLIENT_SECRET"
+    elif [[ "$TS_OAUTH_CLIENT_ID" =~ ^(PASTE_|YOUR_|REPLACE_|\.\.\.|XXX|<.+>)$ ]] || \
+         [[ "$TS_OAUTH_CLIENT_SECRET" =~ ^(PASTE_|YOUR_|REPLACE_|\.\.\.|XXX|<.+>) ]] || \
+         [[ "$TS_OAUTH_CLIENT_ID" == *PASTE_YOUR* ]] || \
+         [[ "$TS_OAUTH_CLIENT_SECRET" == *PASTE_YOUR* ]] || \
+         [[ "$TS_OAUTH_CLIENT_ID" == "YOUR_CLIENT_ID_HERE" ]] || \
+         [[ "$TS_OAUTH_CLIENT_SECRET" == "YOUR_CLIENT_SECRET_HERE" ]]; then
+        err "OAuth file contains placeholder values, not real credentials"
+        info "You appear to have copied the README template literally."
+        info "Generate YOUR OWN OAuth client in the Tailscale admin console:"
+        info "  https://login.tailscale.com/admin/settings/oauth"
+        info "See docs/security.md for why these credentials are unique-per-tailnet."
     else
         # Test the credentials
         TOKEN=$(curl -fsS \
