@@ -1,5 +1,5 @@
 #!/bin/bash
-# Tupperware installer — drops the template-build and clone scripts into /usr/local/sbin.
+# Tupperware installer — drops CLI scripts into /usr/local/sbin.
 # Safe to re-run; overwrites existing scripts in place.
 
 set -euo pipefail
@@ -20,13 +20,6 @@ if ! command -v pct >/dev/null 2>&1; then
 fi
 if ! command -v pveam >/dev/null 2>&1; then
     echo "ERROR: pveam not found. This must run on a Proxmox VE host." >&2
-    exit 1
-fi
-
-if [[ ! -r /root/.tailscale/oauth ]]; then
-    echo "ERROR: /root/.tailscale/oauth is missing or unreadable." >&2
-    echo "       Create it first with your Tailscale OAuth client credentials." >&2
-    echo "       See README.md, Step 1." >&2
     exit 1
 fi
 
@@ -52,7 +45,7 @@ fi
 install_script() {
     local name="$1"
     local target="/usr/local/sbin/${name%.sh}"
-    if [[ $INSTALL_FROM_LOCAL -eq 1 ]]; then
+    if [[ $INSTALL_FROM_LOCAL -eq 1 && -f "$SCRIPT_DIR/$name" ]]; then
         cp "$SCRIPT_DIR/$name" "$target"
     else
         curl -fsSL "$REPO_RAW/scripts/$name" -o "$target"
@@ -62,13 +55,18 @@ install_script() {
 }
 
 echo "[*] Installing scripts..."
+install_script tupperware-preflight.sh
 install_script tupperware-build-template.sh
 install_script tupperware-new.sh
+install_script tupperware-uninstall.sh
 
 echo
 echo "[OK] Tupperware tooling installed."
 echo
 echo "Next steps:"
-echo "  1. Build the template:    tupperware-build-template"
-echo "  2. Install the web UI:    curl -fsSL $REPO_RAW/scripts/install-webui.sh | bash"
-echo "  3. (or test the CLI:      tupperware-new <vmid> <hostname>)"
+echo "  1. Stash OAuth credentials in /root/.tailscale/oauth (see README)"
+echo "  2. Run preflight:         tupperware-preflight"
+echo "  3. Build the template:    tupperware-build-template"
+echo "  4. Install the web UI:    curl -fsSL $REPO_RAW/scripts/install-webui.sh | bash"
+echo
+echo "To remove later:            tupperware-uninstall"
