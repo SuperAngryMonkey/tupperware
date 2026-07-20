@@ -257,6 +257,12 @@ tupperware-new 202 webserver
 
 The CLI doesn't take resource overrides — it inherits template defaults (1 CPU, 512MB RAM, 4GB disk). For custom sizing, use the web UI or apply `pct set` and `pct resize` after the clone.
 
+### MCP (Claude Code / Claude Desktop)
+
+Provision from an AI client instead of the browser or shell. The `mcp/` directory ships a stdio MCP server that wraps the same provisioning path, exposing three tools — `tupperware_host_status`, `tupperware_list_containers`, and `tupperware_provision` (dry-run by default; no destroy tool). It's an HTTP client to this web app, so it runs no `pct` / SSH itself.
+
+See [`mcp/README.md`](mcp/README.md) for setup and [`docs/mcp.md`](docs/mcp.md) for the design.
+
 ### Verifying
 
 After a clone:
@@ -347,6 +353,10 @@ tupperware/
 │   └── tupperware-new.sh
 ├── webui/
 │   └── app.py                   # the Flask app
+├── mcp/                         # MCP server — provision LXCs from Claude Code / Desktop
+│   ├── tupperware_mcp.py        # stdio MCP server (FastMCP)
+│   ├── check_mcp.py             # standalone handshake self-test
+│   └── README.md                # MCP quickstart
 └── docs/
     ├── architecture.md
     ├── troubleshooting.md
