@@ -546,6 +546,23 @@ def api_dest_storage():
     return jsonify({"storages": get_dest_storage(dest)})
 
 
+@app.route("/api/status")
+def api_status():
+    """Read-only host status as JSON (for the Tupperware MCP / scripted clients)."""
+    return jsonify({
+        **host_metrics(),
+        "storages": list_storage_backends(),
+        "default_storage": DEFAULT_STORAGE,
+        "template_ready": template_exists(),
+    })
+
+
+@app.route("/api/containers")
+def api_containers():
+    """Read-only container inventory as JSON (for the Tupperware MCP / scripted clients)."""
+    return jsonify({"containers": list_containers()})
+
+
 @app.route("/clone-stream", methods=["POST"])
 def clone_stream():
     if not template_exists():
