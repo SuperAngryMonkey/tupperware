@@ -163,7 +163,7 @@ fi
 
 # Clone
 echo "[*] Cloning $TEMPLATE_VMID -> $NEW_VMID ($NEW_HOST) on storage '$STORAGE'..."
-pct clone "$TEMPLATE_VMID" "$NEW_VMID" --hostname "$NEW_HOST" --storage "$STORAGE"
+pct clone "$TEMPLATE_VMID" "$NEW_VMID" --hostname "$NEW_HOST" --storage "$STORAGE" --full 1
 
 echo "[*] Starting container..."
 pct start "$NEW_VMID"
