@@ -6,9 +6,9 @@
 #   tupperware-transfer <vmid> <dest-fqdn> [--storage <name>] [--preserve-identity]
 #
 # Examples:
-#   tupperware-transfer 200 proxmox.bobcat-gondola.ts.net
-#   tupperware-transfer 201 proxmox.bobcat-gondola.ts.net --storage local-zfs
-#   tupperware-transfer 202 proxmox.bobcat-gondola.ts.net --preserve-identity
+#   tupperware-transfer 200 proxmox.tailnet-example.ts.net
+#   tupperware-transfer 201 proxmox.tailnet-example.ts.net --storage local-zfs
+#   tupperware-transfer 202 proxmox.tailnet-example.ts.net --preserve-identity
 #
 # Behavior:
 #   1. Stops the source container (if running)
@@ -37,7 +37,7 @@ Usage: tupperware-transfer <vmid> <dest-fqdn> [options]
 Arguments:
   vmid          Source LXC VMID on this host
   dest-fqdn     Tailscale FQDN of destination Proxmox host
-                (e.g., proxmox.bobcat-gondola.ts.net)
+                (e.g., proxmox.tailnet-example.ts.net)
 
 Options:
   --storage <name>      Storage backend on destination (default: local-lvm)

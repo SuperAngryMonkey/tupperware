@@ -43,9 +43,9 @@ diagnose debug application dhcps -1
 
 Then trigger DHCP from a fresh container. You'll see lines like:
 ```
-[debug]Sending ICMP echo-request to 10.0.0.165
-[debug]Received ICMP echo-reply from 10.0.0.165
-[warn]Abandoning IP address 10.0.0.165: pinged before offer
+[debug]Sending ICMP echo-request to 192.0.2.165
+[debug]Received ICMP echo-reply from 192.0.2.165
+[warn]Abandoning IP address 192.0.2.165: pinged before offer
 ```
 
 Each "Abandoning" line is an IP being offered to the FortiGate but rejected because something already has it.

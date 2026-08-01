@@ -6,7 +6,8 @@ LXCs on proxlab through Tupperware — no copy-pasting `tupperware-new` commands
 It's a thin HTTP client over the Tupperware Flask app. It does **not** run `pct`
 or SSH anything itself; every action goes through the same tested endpoints the
 web UI uses. Nothing new is exposed to the internet — the MCP runs on your Mac
-and talks to `http://10.0.1.9:8080` over the tailnet/LAN.
+and talks to the web app over the tailnet/LAN at whatever
+`TUPPERWARE_URL` points to (e.g. `http://192.0.2.9:8080` — placeholder).
 
 ## Tools
 
@@ -25,16 +26,16 @@ This MCP needs two JSON routes added to `webui/app.py` in this repo
 restart the service:
 
 ```bash
-scp webui/app.py root@10.0.1.9:/opt/tupperware/app.py
-ssh root@10.0.1.9 systemctl restart tupperware
+scp webui/app.py root@192.0.2.9:/opt/tupperware/app.py
+ssh root@192.0.2.9 systemctl restart tupperware
 # verify:
-curl -s http://10.0.1.9:8080/api/status | head
+curl -s http://192.0.2.9:8080/api/status | head
 ```
 
 ## Install
 
 ```bash
-cd /Users/jamessmith/Projects/tupperware/mcp
+cd /path/to/projects/tupperware/mcp
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
@@ -43,8 +44,8 @@ python3 -m venv .venv
 
 ```bash
 claude mcp add tupperware -- \
-  /Users/jamessmith/Projects/tupperware/mcp/.venv/bin/python \
-  /Users/jamessmith/Projects/tupperware/mcp/tupperware_mcp.py
+  /path/to/projects/tupperware/mcp/.venv/bin/python \
+  /path/to/projects/tupperware/mcp/tupperware_mcp.py
 ```
 
 If your Mac isn't on the same LAN as proxlab, point it at the tailnet address:
@@ -52,8 +53,8 @@ If your Mac isn't on the same LAN as proxlab, point it at the tailnet address:
 ```bash
 claude mcp add tupperware \
   --env TUPPERWARE_URL=http://100.x.y.z:8080 -- \
-  /Users/jamessmith/Projects/tupperware/mcp/.venv/bin/python \
-  /Users/jamessmith/Projects/tupperware/mcp/tupperware_mcp.py
+  /path/to/projects/tupperware/mcp/.venv/bin/python \
+  /path/to/projects/tupperware/mcp/tupperware_mcp.py
 ```
 
 Then in Claude Code: `/mcp` to confirm `tupperware` is connected.
@@ -70,5 +71,5 @@ Then in Claude Code: `/mcp` to confirm `tupperware` is connected.
 
 | Env | Default | Notes |
 |---|---|---|
-| `TUPPERWARE_URL` | `http://10.0.1.9:8080` | LAN IP; use tailnet IP/MagicDNS if remote |
+| `TUPPERWARE_URL` | _(required)_ | LAN IP of the web app, e.g. `http://192.0.2.9:8080` (placeholder); use tailnet IP/MagicDNS if remote |
 | `TUPPERWARE_TIMEOUT` | `600` | Provision timeout (s). Clone + network wait can take a few minutes |

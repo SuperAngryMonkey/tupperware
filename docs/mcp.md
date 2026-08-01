@@ -54,7 +54,7 @@ model — do not expose the web app to untrusted networks.
 
 | Env | Default | Notes |
 |---|---|---|
-| `TUPPERWARE_URL` | `http://10.0.1.9:8080` | Base URL of the web app. Use the tailnet IP / MagicDNS name if the client isn't on the app's LAN. |
+| `TUPPERWARE_URL` | _(required)_ | Base URL of the web app, e.g. `http://192.0.2.9:8080` (placeholder address). Use the tailnet IP / MagicDNS name if the client isn't on the app's LAN. |
 | `TUPPERWARE_TIMEOUT` | `600` | Provision timeout (s). A clone plus network wait can take minutes. |
 
 ## Setup

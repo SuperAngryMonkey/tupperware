@@ -7,15 +7,15 @@ HTTP surface the web UI uses, so the server holds no direct root power.
 
 Env:
   TUPPERWARE_URL      Base URL of the Tupperware web app.
-                      Default: http://10.0.1.9:8080
+                      Required. Example: http://192.0.2.9:8080
                       (use the tailnet IP / MagicDNS name if your Mac isn't on
                       the same LAN as proxlab, e.g. http://100.x.y.z:8080)
   TUPPERWARE_TIMEOUT  Provision timeout in seconds. Default: 600.
 
 Register with Claude Code (see mcp/README.md):
   claude mcp add tupperware -- \
-    /Users/jamessmith/Projects/tupperware/mcp/.venv/bin/python \
-    /Users/jamessmith/Projects/tupperware/mcp/tupperware_mcp.py
+    /path/to/projects/tupperware/mcp/.venv/bin/python \
+    /path/to/projects/tupperware/mcp/tupperware_mcp.py
 """
 import os
 import re
@@ -24,7 +24,12 @@ from typing import Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-BASE_URL = os.environ.get("TUPPERWARE_URL", "http://10.0.1.9:8080").rstrip("/")
+BASE_URL = os.environ.get("TUPPERWARE_URL", "").rstrip("/")
+if not BASE_URL:
+    raise SystemExit(
+        "TUPPERWARE_URL is not set. Point it at your tupperware web app, "
+        "e.g. TUPPERWARE_URL=http://<host>:8080"
+    )
 PROVISION_TIMEOUT = float(os.environ.get("TUPPERWARE_TIMEOUT", "600"))
 READ_TIMEOUT = 15.0
 
