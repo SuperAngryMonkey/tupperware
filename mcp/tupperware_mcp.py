@@ -31,6 +31,11 @@ if not BASE_URL:
         "e.g. TUPPERWARE_URL=http://<host>:8080"
     )
 PROVISION_TIMEOUT = float(os.environ.get("TUPPERWARE_TIMEOUT", "600"))
+
+# v0.2.2: HTTP Basic Auth. Set both when the web app has an auth file.
+_AUTH_USER = os.environ.get("TUPPERWARE_USER", "")
+_AUTH_PASS = os.environ.get("TUPPERWARE_PASS", "")
+AUTH = (_AUTH_USER, _AUTH_PASS) if _AUTH_USER else None
 READ_TIMEOUT = 15.0
 
 HOSTNAME_RE = re.compile(r"^[a-zA-Z0-9-]+$")
@@ -40,7 +45,7 @@ mcp = FastMCP("tupperware")
 
 
 async def _get(path: str, timeout: float = READ_TIMEOUT) -> dict:
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, auth=AUTH) as client:
         r = await client.get(f"{BASE_URL}{path}")
         r.raise_for_status()
         return r.json()
@@ -151,7 +156,7 @@ async def tupperware_provision(
 
     lines: list[str] = []
     try:
-        async with httpx.AsyncClient(timeout=PROVISION_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=PROVISION_TIMEOUT, auth=AUTH) as client:
             async with client.stream("POST", f"{BASE_URL}/clone-stream", data=form) as r:
                 r.raise_for_status()
                 async for line in r.aiter_lines():

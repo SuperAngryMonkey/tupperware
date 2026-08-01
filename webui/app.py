@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Tupperware v0.2 - LXC provisioner + host-to-host transfer."""
+"""Tupperware v0.2.2 - LXC provisioner + host-to-host transfer.
+
+v0.2.2: optional HTTP Basic Auth covering every route (see AUTH_FILE below).
+"""
 import subprocess
 import re
 import os
 import json
 import time
+import hmac
 from flask import Flask, render_template_string, request, Response, stream_with_context, jsonify
+from werkzeug.security import check_password_hash
 
 app = Flask(__name__)
 
@@ -19,6 +24,69 @@ SAMPLE_TEMPLATE_URL = "https://github.com/SuperAngryMonkey/tupperware/releases/l
 
 # Cache for prox-hosts (60s TTL)
 _PROX_HOSTS_CACHE = {"ts": 0, "data": None}
+
+# --- HTTP Basic Auth (v0.2.2) -------------------------------------------
+# Opt-in: create AUTH_FILE containing a single line "username:werkzeug-hash".
+# Generate the line with:
+#   python3 -c "from werkzeug.security import generate_password_hash as g; \
+#       import getpass; print('admin:' + g(getpass.getpass()))"
+# When the file exists, EVERY route (HTML UI, /api/*, /clone-stream,
+# /transfer-stream) requires Basic auth. When it is absent the app runs
+# unauthenticated (pre-v0.2.2 behavior) and logs a warning at startup.
+AUTH_FILE = os.environ.get("TUPPERWARE_AUTH_FILE", "/root/.tupperware/auth")
+_AUTH_CACHE = {"mtime": None, "cred": None}
+
+
+def _load_auth():
+    """Return (username, pwhash), or None when auth is not configured.
+
+    A malformed or unreadable auth file yields ("", "") so requests are
+    refused (fail closed) rather than silently unauthenticated.
+    """
+    try:
+        st = os.stat(AUTH_FILE)
+    except OSError:
+        return None
+    if _AUTH_CACHE["mtime"] != st.st_mtime:
+        try:
+            with open(AUTH_FILE) as f:
+                line = f.read().strip()
+            user, _, pwhash = line.partition(":")
+            if user and pwhash:
+                _AUTH_CACHE.update(mtime=st.st_mtime, cred=(user, pwhash))
+            else:
+                app.logger.error(
+                    "tupperware: %s is malformed (want user:hash); refusing all requests",
+                    AUTH_FILE,
+                )
+                _AUTH_CACHE.update(mtime=st.st_mtime, cred=("", ""))
+        except OSError as e:
+            app.logger.error(
+                "tupperware: cannot read %s (%s); refusing all requests", AUTH_FILE, e
+            )
+            _AUTH_CACHE.update(mtime=None, cred=("", ""))
+    return _AUTH_CACHE["cred"]
+
+
+@app.before_request
+def _require_auth():
+    cred = _load_auth()
+    if cred is None:
+        return None  # auth not configured; open (pre-v0.2.2 behavior)
+    auth = request.authorization
+    if (
+        auth is not None
+        and auth.type == "basic"
+        and hmac.compare_digest(auth.username or "", cred[0])
+        and cred[1]
+        and check_password_hash(cred[1], auth.password or "")
+    ):
+        return None
+    return Response(
+        "Authentication required.\n",
+        401,
+        {"WWW-Authenticate": 'Basic realm="tupperware"'},
+    )
 
 
 def template_exists():
@@ -645,4 +713,10 @@ def transfer_stream():
 
 
 if __name__ == "__main__":
+    if _load_auth() is None:
+        app.logger.warning(
+            "tupperware: no auth file at %s - web UI is UNAUTHENTICATED "
+            "(create it to require HTTP Basic Auth on all routes)",
+            AUTH_FILE,
+        )
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), threaded=True)
