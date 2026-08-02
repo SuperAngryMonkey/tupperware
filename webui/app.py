@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Tupperware v0.2.3 - LXC provisioner + host-to-host transfer.
+"""Tupperware v0.2.4 - LXC provisioner + host-to-host transfer.
 
 v0.2.2: optional HTTP Basic Auth covering every route (see AUTH_FILE below).
 v0.2.3: parallel inventory gathering + stale-while-revalidate cache, so the
 dashboard and /api/* stay fast on slow hosts.
+v0.2.4: template + storage-backend checks cached too; every dashboard load is
+now subprocess-free on the request path once warm.
 """
 import subprocess
 import re
@@ -93,7 +95,7 @@ def _require_auth():
     )
 
 
-def template_exists():
+def _template_exists_uncached():
     try:
         subprocess.check_output(["pct", "status", str(TEMPLATE_VMID)], stderr=subprocess.DEVNULL, text=True, timeout=5)
     except Exception:
@@ -124,7 +126,7 @@ def next_free_vmid(start=200):
     return v
 
 
-def list_storage_backends():
+def _list_storage_backends_uncached():
     backends = []
     try:
         out = subprocess.check_output(["pvesm", "status", "-content", "rootdir"], text=True, timeout=5)
@@ -179,6 +181,14 @@ def bust_inventory_cache():
     with _CACHE_LOCK:
         for c in _CACHES.values():
             c["ts"] = 0.0
+
+
+def template_exists():
+    return _swr("template", _template_exists_uncached)
+
+
+def list_storage_backends():
+    return _swr("storages", _list_storage_backends_uncached)
 
 
 def _host_metrics_uncached():
@@ -791,5 +801,5 @@ if __name__ == "__main__":
             AUTH_FILE,
         )
     # Warm the inventory caches so the first request is already fast.
-    threading.Thread(target=lambda: (host_metrics(), list_containers()), daemon=True).start()
+    threading.Thread(target=lambda: (host_metrics(), list_containers(), template_exists(), list_storage_backends()), daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), threaded=True)
