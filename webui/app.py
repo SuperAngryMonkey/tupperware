@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Tupperware v0.2.2 - LXC provisioner + host-to-host transfer.
+"""Tupperware v0.2.3 - LXC provisioner + host-to-host transfer.
 
 v0.2.2: optional HTTP Basic Auth covering every route (see AUTH_FILE below).
+v0.2.3: parallel inventory gathering + stale-while-revalidate cache, so the
+dashboard and /api/* stay fast on slow hosts.
 """
 import subprocess
 import re
@@ -9,6 +11,8 @@ import os
 import json
 import time
 import hmac
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, render_template_string, request, Response, stream_with_context, jsonify
 from werkzeug.security import check_password_hash
 
@@ -132,7 +136,52 @@ def list_storage_backends():
     return backends
 
 
-def host_metrics():
+
+# --- Inventory cache (v0.2.3) -------------------------------------------
+# The dashboard and /api/* inventory calls shell out to pct/qm/tailscale
+# many times; on slow hosts that meant 30s+ per request. Results are cached
+# for CACHE_TTL seconds and, once expired, refreshed in a background thread
+# while the stale copy is served (stale-while-revalidate) -- so after the
+# first warm-up every response is instant.
+CACHE_TTL = float(os.environ.get("TUPPERWARE_CACHE_TTL", "30"))
+_CACHE_LOCK = threading.Lock()
+_CACHES = {}
+
+
+def _swr(name, fn):
+    now = time.time()
+    with _CACHE_LOCK:
+        c = _CACHES.setdefault(name, {"ts": 0.0, "data": None, "refreshing": False})
+        if c["data"] is not None and (now - c["ts"] < CACHE_TTL or c["refreshing"]):
+            return c["data"]
+        c["refreshing"] = True
+        stale = c["data"]
+    if stale is not None:
+        threading.Thread(target=_swr_refresh, args=(name, fn), daemon=True).start()
+        return stale
+    return _swr_refresh(name, fn)  # cold start: compute synchronously
+
+
+def _swr_refresh(name, fn):
+    try:
+        data = fn()
+    except Exception:
+        with _CACHE_LOCK:
+            _CACHES[name]["refreshing"] = False
+        raise
+    with _CACHE_LOCK:
+        _CACHES[name].update(ts=time.time(), data=data, refreshing=False)
+    return data
+
+
+def bust_inventory_cache():
+    """Force fresh data on the next read (called after clone/transfer)."""
+    with _CACHE_LOCK:
+        for c in _CACHES.values():
+            c["ts"] = 0.0
+
+
+def _host_metrics_uncached():
     try: ct_count = len(subprocess.check_output(["pct", "list"], text=True).strip().split("\n")) - 1
     except Exception: ct_count = "?"
     try: vm_count = len(subprocess.check_output(["qm", "list"], text=True).strip().split("\n")) - 1
@@ -147,6 +196,10 @@ def host_metrics():
     except Exception: hostname = "proxmox"
     return {"ct_count": ct_count, "vm_count": vm_count, "ts_self": ts_self, "ts_peers": ts_peers,
             "hostname": hostname, "next_vmid": next_free_vmid()}
+
+
+def host_metrics():
+    return _swr("metrics", _host_metrics_uncached)
 
 
 def parse_pct_config(vmid):
@@ -185,33 +238,49 @@ def container_storage(cfg):
     return rootfs.split(":", 1)[0] if ":" in rootfs else ""
 
 
-def list_containers():
-    containers = []
+def _gather_container(parts):
+    vmid, status, name = parts
+    try:
+        cfg = parse_pct_config(vmid)
+        if cfg.get("template") == "1":
+            return None
+        desc = cfg.get("description", "").replace("%0A", "\n").replace("%20", " ")
+        rootfs = cfg.get("rootfs", "")
+        disk_size = ""
+        m = re.search(r"size=(\S+)", rootfs)
+        if m: disk_size = m.group(1)
+        lan_ip = container_ip(vmid) if status == "running" else ""
+        ts_ip = container_tailnet_ip(vmid) if status == "running" else ""
+        return {
+            "vmid": vmid, "name": name, "status": status,
+            "cores": cfg.get("cores", "?"), "memory": cfg.get("memory", "?"),
+            "disk": disk_size, "storage": container_storage(cfg),
+            "lan_ip": lan_ip, "ts_ip": ts_ip,
+            "description": desc, "tags": cfg.get("tags", ""),
+        }
+    except Exception:
+        return None
+
+
+def _list_containers_uncached():
+    rows = []
     try:
         out = subprocess.check_output(["pct", "list"], text=True, timeout=5)
         for line in out.strip().split("\n")[1:]:
             parts = line.split(None, 3)
             if len(parts) < 3: continue
-            vmid = parts[0]; status = parts[1]
-            name = parts[2] if len(parts) > 2 else ""
-            cfg = parse_pct_config(vmid)
-            if cfg.get("template") == "1": continue
-            desc = cfg.get("description", "").replace("%0A", "\n").replace("%20", " ")
-            rootfs = cfg.get("rootfs", "")
-            disk_size = ""
-            m = re.search(r"size=(\S+)", rootfs)
-            if m: disk_size = m.group(1)
-            lan_ip = container_ip(vmid) if status == "running" else ""
-            ts_ip = container_tailnet_ip(vmid) if status == "running" else ""
-            containers.append({
-                "vmid": vmid, "name": name, "status": status,
-                "cores": cfg.get("cores", "?"), "memory": cfg.get("memory", "?"),
-                "disk": disk_size, "storage": container_storage(cfg),
-                "lan_ip": lan_ip, "ts_ip": ts_ip,
-                "description": desc, "tags": cfg.get("tags", ""),
-            })
-    except Exception: pass
-    return containers
+            rows.append((parts[0], parts[1], parts[2]))
+    except Exception:
+        return []
+    if not rows:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(rows))) as ex:
+        results = list(ex.map(_gather_container, rows))
+    return [r for r in results if r is not None]
+
+
+def list_containers():
+    return _swr("containers", _list_containers_uncached)
 
 
 def get_oauth_token():
@@ -674,6 +743,7 @@ def clone_stream():
                 yield "[*] Setting root password...\n"
                 subprocess.run(["pct", "exec", str(vmid_int), "--", "bash", "-c", "echo 'root:" + rootpw + "' | chpasswd"],
                                capture_output=True, text=True)
+            bust_inventory_cache()
             yield "\n[OK] All done.\n"
         except Exception as e:
             yield "\n[!] Exception: " + str(e) + "\n"
@@ -705,6 +775,7 @@ def transfer_stream():
             if proc.returncode != 0:
                 yield "[!] Transfer exited with code " + str(proc.returncode) + "\n"
             else:
+                bust_inventory_cache()
                 yield "\n[OK] Transfer complete.\n"
         except Exception as e:
             yield "\n[!] Exception: " + str(e) + "\n"
@@ -719,4 +790,6 @@ if __name__ == "__main__":
             "(create it to require HTTP Basic Auth on all routes)",
             AUTH_FILE,
         )
+    # Warm the inventory caches so the first request is already fast.
+    threading.Thread(target=lambda: (host_metrics(), list_containers()), daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), threaded=True)

@@ -36,7 +36,7 @@ PROVISION_TIMEOUT = float(os.environ.get("TUPPERWARE_TIMEOUT", "600"))
 _AUTH_USER = os.environ.get("TUPPERWARE_USER", "")
 _AUTH_PASS = os.environ.get("TUPPERWARE_PASS", "")
 AUTH = (_AUTH_USER, _AUTH_PASS) if _AUTH_USER else None
-READ_TIMEOUT = 15.0
+READ_TIMEOUT = float(os.environ.get("TUPPERWARE_READ_TIMEOUT", "45"))
 
 HOSTNAME_RE = re.compile(r"^[a-zA-Z0-9-]+$")
 STORAGE_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
