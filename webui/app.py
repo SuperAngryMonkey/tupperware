@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tupperware v0.2.5 - LXC provisioner + host-to-host transfer.
+"""Tupperware v0.2.6 - LXC provisioner + host-to-host transfer.
 
 v0.2.2: optional HTTP Basic Auth covering every route (see AUTH_FILE below).
 v0.2.3: parallel inventory gathering + stale-while-revalidate cache, so the
@@ -8,9 +8,12 @@ v0.2.4: template + storage-backend checks cached too; every dashboard load is
 now subprocess-free on the request path once warm.
 v0.2.5: TUPPERWARE_BIND env selects the listen address (default 0.0.0.0) so an
 instance can be pinned to the tailscale or LAN interface only.
+v0.2.6: TUPPERWARE_ALLOW_SOURCES (admin-selectable, per host) refuses requests
+from outside a CIDR allow list -- for hosts exposed to the internet.
 """
 import subprocess
 import re
+import ipaddress
 import os
 import json
 import time
@@ -43,6 +46,30 @@ _PROX_HOSTS_CACHE = {"ts": 0, "data": None}
 # unauthenticated (pre-v0.2.2 behavior) and logs a warning at startup.
 AUTH_FILE = os.environ.get("TUPPERWARE_AUTH_FILE", "/root/.tupperware/auth")
 _AUTH_CACHE = {"mtime": None, "cred": None}
+
+
+# --- Source scoping (v0.2.6) --------------------------------------------
+# Admin-selectable, per host: set TUPPERWARE_ALLOW_SOURCES to a comma-
+# separated CIDR list (e.g. "127.0.0.0/8,10.0.0.0/24,100.64.0.0/10") and
+# every request from any other source address is refused with 403, before
+# auth runs. Unset (default) = no restriction. Intended for hosts exposed
+# to the internet; hosts behind a perimeter firewall can leave it unset.
+# A malformed CIDR fails at startup (loudly) rather than running open.
+_raw_sources = os.environ.get("TUPPERWARE_ALLOW_SOURCES", "").strip()
+ALLOW_SOURCES = (
+    [ipaddress.ip_network(s.strip(), strict=False) for s in _raw_sources.split(",") if s.strip()]
+    if _raw_sources else None
+)
+
+
+def _source_allowed(addr):
+    if ALLOW_SOURCES is None:
+        return True
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return any(ip in net for net in ALLOW_SOURCES)
 
 
 def _load_auth():
@@ -78,6 +105,8 @@ def _load_auth():
 
 @app.before_request
 def _require_auth():
+    if not _source_allowed(request.remote_addr or ""):
+        return Response("Forbidden.\n", 403)
     cred = _load_auth()
     if cred is None:
         return None  # auth not configured; open (pre-v0.2.2 behavior)
