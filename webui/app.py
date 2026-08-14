@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Tupperware v0.2.4 - LXC provisioner + host-to-host transfer.
+"""Tupperware v0.2.5 - LXC provisioner + host-to-host transfer.
 
 v0.2.2: optional HTTP Basic Auth covering every route (see AUTH_FILE below).
 v0.2.3: parallel inventory gathering + stale-while-revalidate cache, so the
 dashboard and /api/* stay fast on slow hosts.
 v0.2.4: template + storage-backend checks cached too; every dashboard load is
 now subprocess-free on the request path once warm.
+v0.2.5: TUPPERWARE_BIND env selects the listen address (default 0.0.0.0) so an
+instance can be pinned to the tailscale or LAN interface only.
 """
 import subprocess
 import re
@@ -802,4 +804,5 @@ if __name__ == "__main__":
         )
     # Warm the inventory caches so the first request is already fast.
     threading.Thread(target=lambda: (host_metrics(), list_containers(), template_exists(), list_storage_backends()), daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), threaded=True)
+    app.run(host=os.environ.get("TUPPERWARE_BIND", "0.0.0.0"),
+            port=int(os.environ.get("PORT", 8080)), threaded=True)
