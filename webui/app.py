@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tupperware v0.2.6 - LXC provisioner + host-to-host transfer.
+"""Tupperware v0.2.7 - LXC provisioner + host-to-host transfer.
 
 v0.2.2: optional HTTP Basic Auth covering every route (see AUTH_FILE below).
 v0.2.3: parallel inventory gathering + stale-while-revalidate cache, so the
@@ -10,6 +10,9 @@ v0.2.5: TUPPERWARE_BIND env selects the listen address (default 0.0.0.0) so an
 instance can be pinned to the tailscale or LAN interface only.
 v0.2.6: TUPPERWARE_ALLOW_SOURCES (admin-selectable, per host) refuses requests
 from outside a CIDR allow list -- for hosts exposed to the internet.
+v0.2.7: TUPPERWARE_DEFAULT_STORAGE selects the default storage backend, and
+TUPPERWARE_HIDE_STORAGES hides backends from the picker (e.g. scratch disks),
+both admin-selectable per host.
 """
 import subprocess
 import re
@@ -27,7 +30,14 @@ app = Flask(__name__)
 
 CLONE_SCRIPT = "/usr/local/sbin/tupperware-new"
 TRANSFER_SCRIPT = "/usr/local/sbin/tupperware-transfer"
-DEFAULT_STORAGE = "local-lvm"
+DEFAULT_STORAGE = os.environ.get("TUPPERWARE_DEFAULT_STORAGE", "local-lvm")
+# Admin-selectable per host: comma-separated storage names to keep out of the
+# provisioning picker (e.g. non-redundant scratch disks). Unset = show all.
+# The default storage is never hidden, even if listed, so provisioning cannot
+# be left with no valid target.
+HIDE_STORAGES = {
+    s.strip() for s in os.environ.get("TUPPERWARE_HIDE_STORAGES", "").split(",") if s.strip()
+}
 TEMPLATE_VMID = int(os.environ.get("TEMPLATE_VMID", "9000"))
 OAUTH_FILE = "/root/.tailscale/oauth"
 TRANSFER_LOG = "/var/log/tupperware/transfer.log"
@@ -164,6 +174,8 @@ def _list_storage_backends_uncached():
         for line in out.strip().split("\n")[1:]:
             parts = line.split()
             if len(parts) >= 2:
+                if parts[0] in HIDE_STORAGES and parts[0] != DEFAULT_STORAGE:
+                    continue
                 backends.append({"name": parts[0], "type": parts[1], "active": parts[2] if len(parts) > 2 else "?"})
     except Exception: pass
     return backends

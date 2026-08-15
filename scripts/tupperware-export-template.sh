@@ -71,8 +71,7 @@ echo "[*] Running vzdump (this can take a minute)..."
 vzdump "$VMID" \
     --mode stop \
     --compress zstd \
-    --dumpdir "$DUMP_DIR" \
-    --notes-template "Tupperware-ready Debian 12 LXC template, exported from VMID $VMID"
+    --dumpdir "$DUMP_DIR"
 
 # Find the file vzdump just created
 LATEST=$(ls -t "$DUMP_DIR"/vzdump-lxc-"$VMID"-*.tar.zst 2>/dev/null | head -1)
