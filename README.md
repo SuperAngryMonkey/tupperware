@@ -278,6 +278,90 @@ tailscale ssh root@<hostname>
 
 ---
 
+## Configuration
+
+Every setting below is an environment variable on the `tupperware` systemd service, and every one is optional — with none of them set, the app behaves exactly as it did before these options existed. Set them per host, according to what that host is.
+
+The clean way to set them is a systemd drop-in, so upgrades that replace `app.py` never touch your config:
+
+```bash
+mkdir -p /etc/systemd/system/tupperware.service.d
+cat > /etc/systemd/system/tupperware.service.d/local.conf <<'EOF'
+[Service]
+Environment=TUPPERWARE_DEFAULT_STORAGE=local-zfs
+Environment=TUPPERWARE_HIDE_STORAGES=scratch
+EOF
+systemctl daemon-reload && systemctl restart tupperware
+```
+
+### Access control
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TUPPERWARE_AUTH_FILE` | `/root/.tupperware/auth` | Path to the HTTP Basic Auth file. One line, `username:werkzeug-hash`. **File present** → every route requires auth. **Absent** → unauthenticated, with a startup warning. **Malformed** → fails closed. |
+| `TUPPERWARE_ALLOW_SOURCES` | *(unset)* | Comma-separated CIDR allow list. Requests from any other source address get `403` before auth runs. Unset means no source restriction. |
+| `TUPPERWARE_BIND` | `0.0.0.0` | Listen address. Pin to a tailscale or LAN interface address to stop the app listening on other interfaces. |
+| `PORT` | `8080` | Listen port. Change it when something else already owns 8080 on the host. |
+
+Create an auth file with:
+
+```bash
+mkdir -p /root/.tupperware
+python3 -c "from werkzeug.security import generate_password_hash as g; \
+    import getpass; print('admin:' + g(getpass.getpass()))" > /root/.tupperware/auth
+chmod 600 /root/.tupperware/auth
+```
+
+The file is re-read when it changes, so rotating a password needs no restart.
+
+### Storage
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TUPPERWARE_DEFAULT_STORAGE` | `local-lvm` | Default storage backend for provisioning. ZFS-backed hosts have no `local-lvm` and **must** set this. |
+| `TUPPERWARE_HIDE_STORAGES` | *(unset)* | Comma-separated backends to keep out of the provisioning picker — scratch or non-redundant disks that should never receive a container. The default storage is never hidden, even if listed, so a host always has a valid target. |
+
+### Performance
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TUPPERWARE_CACHE_TTL` | `30` | Seconds before cached inventory and host metrics are refreshed. Expired data is served immediately while a background thread refreshes it, so requests never block on `pct`. Clone and transfer bust the cache on completion. |
+
+And in the MCP client's environment (see [`mcp/README.md`](mcp/README.md)):
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TUPPERWARE_URL` | *(required)* | Base URL of the web app the MCP talks to, e.g. `http://100.64.0.5:8080`. |
+| `TUPPERWARE_USER` / `TUPPERWARE_PASS` | *(unset)* | Basic Auth credentials, when the target host has an auth file. Leave unset against an un-authed host. |
+| `TUPPERWARE_READ_TIMEOUT` | `45` | Seconds to wait on read calls. Raise it for slow hosts with many containers. |
+
+### Worked examples
+
+**A host behind a perimeter firewall, LVM storage** — nothing to set. Defaults are correct.
+
+**A host on a private LAN, reachable over the tailnet, with auth on:**
+
+```ini
+[Service]
+Environment=TUPPERWARE_ALLOW_SOURCES=127.0.0.0/8,10.0.0.0/24,100.64.0.0/10
+```
+
+**A host with a public IP, ZFS storage, a scratch disk, and 8080 already taken:**
+
+```ini
+[Service]
+Environment=PORT=8081
+Environment=TUPPERWARE_ALLOW_SOURCES=127.0.0.0/8,10.10.10.0/24,100.64.0.0/10
+Environment=TUPPERWARE_DEFAULT_STORAGE=local-zfs
+Environment=TUPPERWARE_HIDE_STORAGES=scratch
+```
+
+Pair that with an auth file and a host firewall rule for the port. See [`docs/security.md`](docs/security.md) for how the layers stack.
+
+
+
+---
+
 ## Troubleshooting
 
 ### "Network never came up" during build

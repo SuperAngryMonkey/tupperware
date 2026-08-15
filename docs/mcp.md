@@ -46,16 +46,26 @@ The MCP needs machine-readable reads, so `webui/app.py` gained:
 - `GET /api/status` — `host_metrics()` plus `storages`, `default_storage`, `template_ready`
 - `GET /api/containers` — `{"containers": [...]}`
 
-Both are read-only JSON wrappers around functions the dashboard already used. They
-are unauthenticated, consistent with the rest of the web UI's tailnet-only access
-model — do not expose the web app to untrusted networks.
+Both are read-only JSON wrappers around functions the dashboard already used.
+
+Since v0.2.2 they are covered by the web app's HTTP Basic Auth when the host has an
+auth file, and since v0.2.6 by `TUPPERWARE_ALLOW_SOURCES` when that is set — so the
+MCP must authenticate like any other client (see Configuration below). On a host with
+neither configured they remain open, consistent with the tailnet-only access model.
 
 ## Configuration
 
 | Env | Default | Notes |
 |---|---|---|
 | `TUPPERWARE_URL` | _(required)_ | Base URL of the web app, e.g. `http://192.0.2.9:8080` (placeholder address). Use the tailnet IP / MagicDNS name if the client isn't on the app's LAN. |
+| `TUPPERWARE_USER` | _(unset)_ | Basic Auth username, when the target host has an auth file. |
+| `TUPPERWARE_PASS` | _(unset)_ | Basic Auth password. Both must be set; leave both unset against an un-authed host. |
 | `TUPPERWARE_TIMEOUT` | `600` | Provision timeout (s). A clone plus network wait can take minutes. |
+| `TUPPERWARE_READ_TIMEOUT` | `45` | Read-call timeout (s). Raise for slow hosts with many containers. |
+
+A `401` from any tool means the host has auth on and the client env is missing or wrong;
+a `403` means the client's source address is outside that host's `TUPPERWARE_ALLOW_SOURCES`.
+The full server-side reference is in the [README Configuration section](../README.md#configuration).
 
 ## Setup
 

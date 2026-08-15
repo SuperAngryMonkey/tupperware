@@ -1,6 +1,6 @@
-# Security — OAuth Credentials and Key Handling
+# Security — Credentials, Keys, and Web App Access
 
-Tupperware's whole design rests on one piece of long-lived credential: a Tailscale OAuth client stored at `/root/.tailscale/oauth` on your Proxmox host. This document explains what that credential does, what it can and can't do, and how to rotate it if anything ever feels off.
+Tupperware's whole design rests on one piece of long-lived credential: a Tailscale OAuth client stored at `/root/.tailscale/oauth` on your Proxmox host. This document explains what that credential does, what it can and can't do, and how to rotate it if anything ever feels off. The second half covers securing the web app itself — authentication, source scoping, and how the layers stack.
 
 ---
 
@@ -153,6 +153,71 @@ The rotation procedure is short enough that there's no excuse not to rotate when
 **Q: Can I tell who's been using my OAuth client?**
 
 Tailscale logs OAuth token requests in the audit log (https://login.tailscale.com/admin/settings/audit-logs). You can see when keys were minted, by which client, and which tag was applied. If you see key mints you don't recognize, rotate.
+---
+
+## Securing the web app itself
+
+The OAuth credential above is one secret. The other exposure is the web app: it runs as
+root and shells out to `pct`, `qm`, `pvesm`, and the `tupperware-*` scripts, so whoever
+can reach it and authenticate can create and move containers on that host. There is no
+destroy or purge path anywhere in the app, so the worst case from a leaked credential is
+unwanted containers and consumed resources — not destroyed data.
+
+Three independent controls exist, each optional and each configured per host. Use the
+combination that matches that host's exposure. All three are set as environment variables
+on the service; see the [README Configuration section](../README.md#configuration) for
+syntax and defaults.
+
+### 1. Authentication — `TUPPERWARE_AUTH_FILE`
+
+HTTP Basic Auth covering **every** route: the HTML UI, `/api/status`, `/api/containers`,
+`/clone-stream`, and `/transfer-stream`. Enabled by the presence of the auth file; absent
+means the app runs open and logs a warning at startup; malformed or unreadable means it
+fails closed and refuses everything rather than silently dropping to open.
+
+Passwords are stored as werkzeug hashes, never plaintext, and compared with
+`hmac.compare_digest`. The file is re-read when it changes, so rotation needs no restart.
+
+Give each host its own credential. Sharing one across hosts turns a single leak into a
+multi-host leak for no benefit.
+
+### 2. Source scoping — `TUPPERWARE_ALLOW_SOURCES`
+
+A CIDR allow list checked before authentication; anything from another source address gets
+`403`. Unset means no restriction, which is the right setting for a host behind a perimeter
+firewall. It exists for hosts that are actually reachable from the internet.
+
+A malformed CIDR fails at startup rather than leaving the host silently unrestricted.
+
+### 3. Listen interface — `TUPPERWARE_BIND`
+
+Pins the listener to one address, so the app never accepts connections on other interfaces.
+Use it when a single interface is the correct scope. When the app must answer on two
+internal interfaces (LAN *and* tailnet) but never externally, leave the default bind and
+scope with `TUPPERWARE_ALLOW_SOURCES` plus a host firewall rule instead.
+
+### Layering, and what each layer is worth
+
+These are independent, and none is a substitute for a network perimeter:
+
+- Basic Auth over plain HTTP protects against unauthorized use, not against someone who can
+  already read traffic on the path. Keep the app on trusted networks regardless.
+- Source scoping is enforced by the app, so it survives changes to the network but not a
+  compromise of the host.
+- A host firewall rule (nftables, or Proxmox's own `pve-firewall`) enforces in the kernel
+  and is the layer that keeps working if the app misbehaves.
+
+A host with a public IP should have all of them. A host behind a perimeter firewall on a
+trusted LAN reasonably has only the first, or none.
+
+### Ports
+
+The app defaults to `8080`. If something else on the host already owns that port — a
+monitoring agent or IDS, for example — set `PORT` rather than displacing the incumbent, and
+remember to reflect the new port in the MCP client's `TUPPERWARE_URL` and in any firewall
+rule.
+
+
 
 ---
 
