@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tupperware v0.2.7 - LXC provisioner + host-to-host transfer.
+"""Tupperware v0.2.8 - LXC provisioner + host-to-host transfer.
 
 v0.2.2: optional HTTP Basic Auth covering every route (see AUTH_FILE below).
 v0.2.3: parallel inventory gathering + stale-while-revalidate cache, so the
@@ -13,6 +13,8 @@ from outside a CIDR allow list -- for hosts exposed to the internet.
 v0.2.7: TUPPERWARE_DEFAULT_STORAGE selects the default storage backend, and
 TUPPERWARE_HIDE_STORAGES hides backends from the picker (e.g. scratch disks),
 both admin-selectable per host.
+v0.2.8: SMART disk health at /api/disks (NVMe + SATA), cached separately via
+TUPPERWARE_DISK_CACHE_TTL.
 """
 import subprocess
 import re
