@@ -75,6 +75,22 @@ async def tupperware_list_containers() -> dict:
 
 
 @mcp.tool()
+async def tupperware_disk_health() -> dict:
+    """SMART health for the host's physical disks: model, capacity, power-on
+    hours, wear, lifetime writes, reallocated sectors, temperature, and the
+    drive's own PASS/FAIL verdict. Read-only.
+
+    Wear reporting: NVMe drives report used_pct directly. SATA drives only
+    report it when they expose a trustworthy life-left attribute; when they
+    do not, used_pct is null and drive_writes (full-capacity writes) is the
+    wear signal - compare it against the model's rated endurance."""
+    try:
+        return await _get("/api/disks")
+    except Exception as e:
+        return {"error": f"Could not reach Tupperware at {BASE_URL}: {e}"}
+
+
+@mcp.tool()
 async def tupperware_provision(
     hostname: str,
     cores: Optional[int] = None,

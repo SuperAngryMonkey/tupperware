@@ -326,6 +326,7 @@ The file is re-read when it changes, so rotating a password needs no restart.
 | Variable | Default | What it does |
 |---|---|---|
 | `TUPPERWARE_CACHE_TTL` | `30` | Seconds before cached inventory and host metrics are refreshed. Expired data is served immediately while a background thread refreshes it, so requests never block on `pct`. Clone and transfer bust the cache on completion. |
+| `TUPPERWARE_DISK_CACHE_TTL` | `600` | Seconds before cached SMART disk data is refreshed. Longer than the inventory TTL because `smartctl` is slow and drive health moves slowly. |
 
 And in the MCP client's environment (see [`mcp/README.md`](mcp/README.md)):
 

@@ -193,11 +193,12 @@ _CACHE_LOCK = threading.Lock()
 _CACHES = {}
 
 
-def _swr(name, fn):
+def _swr(name, fn, ttl=None):
+    ttl = CACHE_TTL if ttl is None else ttl
     now = time.time()
     with _CACHE_LOCK:
         c = _CACHES.setdefault(name, {"ts": 0.0, "data": None, "refreshing": False})
-        if c["data"] is not None and (now - c["ts"] < CACHE_TTL or c["refreshing"]):
+        if c["data"] is not None and (now - c["ts"] < ttl or c["refreshing"]):
             return c["data"]
         c["refreshing"] = True
         stale = c["data"]
@@ -753,6 +754,12 @@ def api_containers():
     return jsonify({"containers": list_containers()})
 
 
+@app.route("/api/disks")
+def api_disks():
+    """SMART health for the host's physical disks (MCP / scripted clients)."""
+    return jsonify({"disks": list_disks()})
+
+
 @app.route("/clone-stream", methods=["POST"])
 def clone_stream():
     if not template_exists():
@@ -835,6 +842,157 @@ def transfer_stream():
 
     return Response(stream_with_context(generate()), mimetype="text/plain")
 
+
+
+# --- Disk health (v0.2.8) -----------------------------------------------
+# SMART data for the host's physical disks. smartctl is slow and the data
+# moves slowly, so this gets its own long TTL on the same SWR cache.
+DISK_CACHE_TTL = float(os.environ.get("TUPPERWARE_DISK_CACHE_TTL", "600"))
+
+# Vendor-specific SATA attribute IDs that carry a normalized life-left value
+# (100 = new, counts down). NVMe reports percentage_used directly instead.
+_WEAR_IDS = (231, 202, 177, 233, 173)
+# ID alone is not enough: 233 is Media_Wearout_Indicator on Intel but
+# NAND_GiB_Written on SanDisk. Require the name to look like a life gauge,
+# and reject anything that is plainly a byte/block counter.
+_WEAR_NAMES = ("wear_leveling", "ssd_life_left", "media_wearout",
+               "percent_life", "remaining_life", "lifetime_remain",
+               "percent_lifetime")
+_WEAR_NOT = ("written", "gib", "lba", "read", "erase_count", "host")
+
+
+def _physical_disks():
+    """Real disks only - no zvols, loop, or device-mapper entries."""
+    try:
+        out = subprocess.check_output(
+            ["lsblk", "-dn", "-o", "NAME,TYPE"], text=True, timeout=10)
+    except Exception:
+        return []
+    names = []
+    for line in out.strip().split("\n"):
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == "disk":
+            if parts[0].startswith(("zd", "loop", "dm-", "sr")):
+                continue
+            names.append("/dev/" + parts[0])
+    return names
+
+
+def _smart(dev):
+    """smartctl JSON for one device. Non-zero exit is normal (bit flags), so
+    parse stdout regardless and only treat unparseable output as failure."""
+    try:
+        p = subprocess.run(["smartctl", "--json=c", "-H", "-A", "-i", dev],
+                           capture_output=True, text=True, timeout=40)
+        return json.loads(p.stdout)
+    except Exception:
+        return None
+
+
+def _disk_from_smart(dev, j):
+    d = {"device": dev, "model": j.get("model_name", "?"),
+         "serial": j.get("serial_number", ""), "kind": "sata",
+         "capacity_gb": None, "power_on_hours": None, "used_pct": None,
+         "written_tb": None, "reallocated": None, "temp_c": None,
+         "spare_pct": None, "healthy": None, "wear_source": None}
+    cap = (j.get("user_capacity") or {}).get("bytes")
+    if cap:
+        d["capacity_gb"] = round(cap / 1e9)
+    st = j.get("smart_status")
+    if isinstance(st, dict) and "passed" in st:
+        d["healthy"] = bool(st["passed"])
+    t = (j.get("temperature") or {}).get("current")
+    if isinstance(t, int):
+        d["temp_c"] = t
+    return d
+
+
+def _fill_nvme(d, j):
+    log = j.get("nvme_smart_health_information_log") or {}
+    if not log:
+        return
+    d["kind"] = "nvme"
+    if "percentage_used" in log:
+        d["used_pct"] = log["percentage_used"]
+        d["wear_source"] = "nvme percentage_used"
+    d["power_on_hours"] = log.get("power_on_hours")
+    d["spare_pct"] = log.get("available_spare")
+    duw = log.get("data_units_written")
+    if duw:
+        # 1 data unit = 1000 x 512-byte blocks
+        d["written_tb"] = round(duw * 512000 / 1e12, 1)
+
+
+def _fill_sata(d, j):
+    tbl = ((j.get("ata_smart_attributes") or {}).get("table")) or []
+    if not tbl:
+        return
+    by_id = {a.get("id"): a for a in tbl}
+    a9 = by_id.get(9)
+    if a9:
+        d["power_on_hours"] = (a9.get("raw") or {}).get("value")
+    a5 = by_id.get(5)
+    if a5:
+        d["reallocated"] = (a5.get("raw") or {}).get("value")
+    for wid in _WEAR_IDS:
+        a = by_id.get(wid)
+        if not a or not isinstance(a.get("value"), int):
+            continue
+        nm = (a.get("name") or "").lower()
+        if not any(w in nm for w in _WEAR_NAMES):
+            continue
+        if any(w in nm for w in _WEAR_NOT):
+            continue
+        d["used_pct"] = max(0, 100 - a["value"])
+        d["wear_source"] = "attr %d %s" % (wid, a.get("name", ""))
+        break
+
+
+def _sata_written_tb(d, j):
+    """Lifetime writes: attr 241 is LBAs on most drives, GiB on some SanDisk."""
+    tbl = ((j.get("ata_smart_attributes") or {}).get("table")) or []
+    for a in tbl:
+        if a.get("id") != 241:
+            continue
+        raw = (a.get("raw") or {}).get("value")
+        if not raw:
+            return
+        name = (a.get("name") or "").lower()
+        if "gib" in name:
+            d["written_tb"] = round(raw * 1.073741824 / 1000, 1)
+        else:
+            d["written_tb"] = round(raw * 512 / 1e12, 1)
+        return
+
+
+def _gather_disk(dev):
+    j = _smart(dev)
+    if not j:
+        return {"device": dev, "model": "?", "error": "smartctl unavailable"}
+    d = _disk_from_smart(dev, j)
+    _fill_nvme(d, j)
+    if d["kind"] != "nvme":
+        _fill_sata(d, j)
+        _sata_written_tb(d, j)
+    # Vendor-neutral wear signal: full-capacity writes. Meaningful even when
+    # the drive exposes no life-left attribute (compare against its rated TBW).
+    if d.get("written_tb") and d.get("capacity_gb"):
+        d["drive_writes"] = round(d["written_tb"] * 1000 / d["capacity_gb"], 1)
+    else:
+        d["drive_writes"] = None
+    return d
+
+
+def _disks_uncached():
+    devs = _physical_disks()
+    if not devs:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(devs))) as ex:
+        return list(ex.map(_gather_disk, devs))
+
+
+def list_disks():
+    return _swr("disks", _disks_uncached, ttl=DISK_CACHE_TTL)
 
 if __name__ == "__main__":
     if _load_auth() is None:
